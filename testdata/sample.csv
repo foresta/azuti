@@ -1,0 +1,11 @@
+id,name,role,city,score
+1,Ada Lovelace,Analyst,London,91.5
+2,Alan Turing,Engineer,Manchester,88.0
+3,Grace Hopper,Engineer,New York,95.2
+4,Katherine Johnson,Analyst,Hampton,97.8
+5,Edsger Dijkstra,Engineer,Rotterdam,84.1
+6,Barbara Liskov,Engineer,Boston,92.4
+7,Donald Knuth,Researcher,Stanford,99.0
+8,Margaret Hamilton,Engineer,Boston,96.3
+9,Linus Torvalds,Engineer,Portland,87.6
+10,Radia Perlman,Engineer,Seattle,90.9

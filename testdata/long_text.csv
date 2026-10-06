@@ -1,0 +1,5 @@
+id,name,note
+1,short,ok
+2,medium,This note is a bit longer than the column but still readable.
+3,very_long,This is an intentionally very long description that far exceeds the 40-character column cap so we can observe how the cell is clipped when it does not fit the allotted width in the table view.
+4,unicode,日本語の長いテキストも混ぜてみる。全角文字が含まれると幅計算がどうなるかを確認するための行です。
