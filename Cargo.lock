@@ -397,6 +397,7 @@ dependencies = [
  "color-eyre",
  "parquet",
  "ratatui",
+ "unicode-width",
 ]
 
 [[package]]

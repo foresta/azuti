@@ -11,6 +11,8 @@ use ratatui::{
     DefaultTerminal, Frame,
 };
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use crate::data::DataTable;
 
 /// Rows beyond this are not scanned when measuring column widths (keeps load
@@ -31,8 +33,8 @@ pub struct App {
     columns: Vec<String>,
     /// Rows, each already formatted to display strings (step b baseline).
     rows: Vec<Vec<String>>,
-    /// Precomputed per-column widths.
-    widths: Vec<Constraint>,
+    /// Precomputed per-column display widths, in terminal cells.
+    col_widths: Vec<u16>,
     /// Table selection / scroll position.
     table_state: TableState,
     /// One-line status shown as the table title (load result or error).
@@ -50,7 +52,7 @@ impl App {
             }
             Some(path) => match DataTable::load(&path).and_then(|t| Ok((t.column_names(), t.num_rows(), t.num_cols(), t.to_string_rows()?))) {
                 Ok((columns, nrows, ncols, rows)) => {
-                    app.widths = column_widths(&columns, &rows);
+                    app.col_widths = column_widths(&columns, &rows);
                     app.columns = columns;
                     app.rows = rows;
                     if !app.rows.is_empty() {
@@ -99,15 +101,29 @@ impl App {
             let block = Block::bordered().title(" Results ");
             frame.render_widget(Paragraph::new(self.status.clone()).block(block), body);
         } else {
-            let header_row = Row::new(self.columns.iter().map(|c| Cell::from(c.clone())))
-                .style(Style::new().bold());
+            let header_row = Row::new(
+                self.columns
+                    .iter()
+                    .zip(&self.col_widths)
+                    .map(|(c, w)| Cell::from(truncate_display(c, *w))),
+            )
+            .style(Style::new().bold());
+
             let body_rows: Vec<Row> = self
                 .rows
                 .iter()
-                .map(|r| Row::new(r.iter().map(|c| Cell::from(c.clone()))))
+                .map(|r| {
+                    Row::new(
+                        r.iter()
+                            .zip(&self.col_widths)
+                            .map(|(c, w)| Cell::from(truncate_display(c, *w))),
+                    )
+                })
                 .collect();
 
-            let table = Table::new(body_rows, self.widths.clone())
+            let constraints: Vec<Constraint> =
+                self.col_widths.iter().map(|w| Constraint::Length(*w)).collect();
+            let table = Table::new(body_rows, constraints)
                 .header(header_row)
                 .row_highlight_style(Style::new().reversed())
                 .highlight_symbol("> ")
@@ -183,19 +199,86 @@ fn key(label: &str) -> Span<'_> {
     )
 }
 
-/// Measure a display width per column from the header plus a sample of rows.
-fn column_widths(columns: &[String], rows: &[Vec<String>]) -> Vec<Constraint> {
+/// Measure a display width (terminal cells) per column from the header plus a
+/// sample of rows. Uses Unicode display width so full-width characters count
+/// as 2, matching how the terminal renders them.
+fn column_widths(columns: &[String], rows: &[Vec<String>]) -> Vec<u16> {
     columns
         .iter()
         .enumerate()
         .map(|(i, name)| {
-            let mut width = name.chars().count();
+            let mut width = name.width();
             for row in rows.iter().take(WIDTH_SAMPLE_ROWS) {
                 if let Some(cell) = row.get(i) {
-                    width = width.max(cell.chars().count());
+                    width = width.max(cell.width());
                 }
             }
-            Constraint::Length((width as u16).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH))
+            (width as u16).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH)
         })
         .collect()
+}
+
+/// Truncate `s` to at most `max` display cells, appending `…` when it is cut.
+/// Width-aware so a full-width character is never split across the boundary.
+fn truncate_display(s: &str, max: u16) -> String {
+    let max = max as usize;
+    if s.width() <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    // Reserve one cell for the ellipsis.
+    let budget = max - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if used + cw > budget {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out.push('…');
+    out
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// Render a loaded file to an in-memory terminal and return the frame as text.
+    fn render(path: &str, w: u16, h: u16) -> String {
+        let full = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path);
+        let mut app = App::new(Some(full));
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        format!("{}", terminal.backend())
+    }
+
+    #[test]
+    fn long_cells_are_truncated_with_ellipsis() {
+        let out = render("testdata/long_text.csv", 100, 12);
+        assert!(
+            out.contains('…'),
+            "expected an ellipsis on clipped cells:\n{out}"
+        );
+    }
+
+    #[test]
+    fn renders_without_panic() {
+        // Full-width text and a wide (40-column) table must both render.
+        assert!(render("testdata/long_text.csv", 100, 12).contains("azuti"));
+        assert!(render("testdata/wide.csv", 100, 12).contains("azuti"));
+    }
+
+    #[test]
+    fn truncate_display_respects_width_and_fullwidth() {
+        assert_eq!(truncate_display("hello", 10), "hello");
+        assert_eq!(truncate_display("hello world", 8), "hello w…");
+        // Each CJK char is 2 cells: width 5 fits two chars (4) + ellipsis (1).
+        assert_eq!(truncate_display("あいうえお", 5), "あい…");
+    }
 }
