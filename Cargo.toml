@@ -1,0 +1,18 @@
+[package]
+name = "azuti"
+version = "0.1.0"
+edition = "2021"
+description = "A fast terminal (TUI) data viewer — queries land and line up like arrows in the azuchi (the archery target mound)"
+license = "MIT"
+repository = "https://github.com/foresta/azuti"
+readme = "README.md"
+
+[dependencies]
+# TUI framework. We rely on the crossterm re-exported by ratatui
+# (via `ratatui::crossterm`) instead of depending on crossterm directly,
+# to avoid version mismatches.
+ratatui = "0.30"
+# CLI argument parsing.
+clap = { version = "4", features = ["derive"] }
+# Error handling + readable panic/error reports.
+color-eyre = "0.6"

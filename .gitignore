@@ -1,0 +1,7 @@
+# Rust build artifacts
+/target
+
+# This is a binary crate, so Cargo.lock is committed (not ignored here).
+
+# OS / editor
+.DS_Store
