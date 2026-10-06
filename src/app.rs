@@ -198,24 +198,44 @@ impl App {
         self.viewport_rows = visible.max(1);
         self.clamp_offset();
 
-        let data = self.data.as_ref().expect("has_rows checked before render_table");
-        let formatters = match data.formatters() {
-            Ok(f) => f,
-            Err(err) => {
-                let block = Block::bordered().title(" Results ");
-                frame.render_widget(Paragraph::new(format!("Render error: {err:#}")).block(block), area);
-                return;
+        // Format just the visible window once; reuse it for sizing and rendering.
+        let end = (self.offset + self.viewport_rows).min(self.nrows);
+        let visible: Vec<Vec<String>> = {
+            let data = self.data.as_ref().expect("has_rows checked before render_table");
+            match data.formatters() {
+                Ok(formatters) => (self.offset..end)
+                    .map(|r| formatters.iter().map(|f| f.value(r).to_string()).collect())
+                    .collect(),
+                Err(err) => {
+                    let block = Block::bordered().title(" Results ");
+                    frame.render_widget(
+                        Paragraph::new(format!("Render error: {err:#}")).block(block),
+                        area,
+                    );
+                    return;
+                }
             }
         };
 
-        let end = (self.offset + self.viewport_rows).min(self.nrows);
-        let rows: Vec<Row> = (self.offset..end)
-            .map(|r| {
+        // Grow column widths so values scrolled into view always fit. Widths only
+        // ever grow (capped at MAX_COL_WIDTH), so they do not jitter while
+        // scrolling and later, wider values are not clipped by an early estimate.
+        for row in &visible {
+            for (c, cell) in row.iter().enumerate() {
+                let w = clamp_width(cell.width());
+                if w > self.col_widths[c] {
+                    self.col_widths[c] = w;
+                }
+            }
+        }
+
+        let rows: Vec<Row> = visible
+            .iter()
+            .map(|row| {
                 Row::new(
-                    formatters
-                        .iter()
+                    row.iter()
                         .zip(&self.col_widths)
-                        .map(|(f, w)| Cell::from(truncate_display(&f.value(r).to_string(), *w)))
+                        .map(|(cell, w)| Cell::from(truncate_display(cell, *w)))
                         .collect::<Vec<_>>(),
                 )
             })
@@ -528,6 +548,24 @@ mod render_tests {
         assert!(
             bottom.contains("item-999"),
             "scrolling to the end should reveal the last row:\n{bottom}"
+        );
+    }
+
+    #[test]
+    fn columns_grow_to_fit_values_scrolled_into_view() {
+        // Columns are sized from the first rows, where ids are narrow. A much
+        // wider id deep in the data must still be shown in full once scrolled to.
+        let mut app = App::from_demo(1_000_000);
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+
+        terminal.draw(|f| app.render(f)).unwrap(); // size from the first page
+        app.select(999_999);
+        terminal.draw(|f| app.render(f)).unwrap();
+        let out = format!("{}", terminal.backend());
+
+        assert!(
+            out.contains("item-999999"),
+            "a wide value scrolled into view must not be clipped:\n{out}"
         );
     }
 }
