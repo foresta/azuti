@@ -16,13 +16,13 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::data::DataTable;
 
 /// Rows beyond this are not scanned when measuring column widths (keeps load
-/// cheap on large files; step c revisits sizing).
+/// cheap on large tables).
 const WIDTH_SAMPLE_ROWS: usize = 200;
 /// Per-column display width is clamped to this range.
 const MIN_COL_WIDTH: u16 = 3;
 const MAX_COL_WIDTH: u16 = 40;
-/// How many rows Page Up / Page Down moves the selection.
-const PAGE_STEP: usize = 20;
+/// How many lines Page Up / Page Down moves inside the detail overlay.
+const DETAIL_PAGE_STEP: usize = 20;
 
 /// Which view currently has focus.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -35,19 +35,29 @@ enum Mode {
 }
 
 /// Top-level application state.
+///
+/// The data stays in Arrow columns inside [`DataTable`]; the view formats only
+/// the rows currently on screen (viewport rendering), so cost does not grow with
+/// the total row count.
 #[derive(Debug, Default)]
 pub struct App {
     /// Whether the main loop keeps running. Set to false to quit.
     running: bool,
+    /// The loaded data, if any.
+    data: Option<DataTable>,
     /// Column headers.
     columns: Vec<String>,
-    /// Rows, each already formatted to display strings (step b baseline).
-    rows: Vec<Vec<String>>,
-    /// Precomputed per-column display widths, in terminal cells.
+    /// Per-column display widths, in terminal cells.
     col_widths: Vec<u16>,
-    /// Table selection / scroll position.
-    table_state: TableState,
-    /// One-line status shown as the table title (load result or error).
+    /// Total number of rows.
+    nrows: usize,
+    /// Absolute index of the selected row.
+    selected: usize,
+    /// Absolute index of the first visible row.
+    offset: usize,
+    /// Number of body rows that fit on screen (updated each render).
+    viewport_rows: usize,
+    /// One-line status shown in the table title (load result or error).
     status: String,
     /// Current view (table or the row-detail overlay).
     mode: Mode,
@@ -59,28 +69,62 @@ impl App {
     /// Build the app, loading `path` if one was given. A load error is captured
     /// into the status line rather than crashing the UI.
     pub fn new(path: Option<PathBuf>) -> Self {
-        let mut app = App::default();
         match path {
-            None => {
-                app.status = "No file given. Pass a .csv or .parquet path.".to_string();
-            }
-            Some(path) => match DataTable::load(&path).and_then(|t| Ok((t.column_names(), t.num_rows(), t.num_cols(), t.to_string_rows()?))) {
-                Ok((columns, nrows, ncols, rows)) => {
-                    app.col_widths = column_widths(&columns, &rows);
-                    app.columns = columns;
-                    app.rows = rows;
-                    if !app.rows.is_empty() {
-                        app.table_state.select(Some(0));
-                    }
-                    app.status = format!("{}  —  {} rows × {} cols", path.display(), nrows, ncols);
+            None => App::empty("No file given. Pass a .csv or .parquet path, or use --demo N."),
+            Some(path) => match DataTable::load(&path) {
+                Ok(data) => {
+                    let status = format!(
+                        "{}  —  {} rows × {} cols",
+                        path.display(),
+                        data.num_rows(),
+                        data.num_cols()
+                    );
+                    App::loaded(data, status)
                 }
-                Err(err) => {
-                    // `{:#}` prints the whole eyre error chain on one line.
-                    app.status = format!("Error loading {}: {:#}", path.display(), err);
-                }
+                // `{:#}` prints the whole eyre error chain on one line.
+                Err(err) => App::empty(&format!("Error loading {}: {:#}", path.display(), err)),
             },
         }
-        app
+    }
+
+    /// Build the app on top of a synthetic table (for stress-testing).
+    pub fn from_demo(nrows: usize) -> Self {
+        let data = DataTable::demo(nrows);
+        let status = format!(
+            "demo  —  {} rows × {} cols",
+            data.num_rows(),
+            data.num_cols()
+        );
+        App::loaded(data, status)
+    }
+
+    fn empty(status: &str) -> Self {
+        App {
+            status: status.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn loaded(data: DataTable, status: String) -> Self {
+        let columns = data.column_names();
+        let nrows = data.num_rows();
+        let col_widths = data
+            .column_display_widths(WIDTH_SAMPLE_ROWS)
+            .map(|ws| ws.into_iter().map(clamp_width).collect())
+            .unwrap_or_else(|_| columns.iter().map(|_| MIN_COL_WIDTH).collect());
+
+        App {
+            columns,
+            col_widths,
+            nrows,
+            status,
+            data: Some(data),
+            ..Default::default()
+        }
+    }
+
+    fn has_rows(&self) -> bool {
+        self.data.is_some() && self.nrows > 0
     }
 
     /// Main loop: draw, then handle input, repeated while `running` is set.
@@ -110,40 +154,11 @@ impl App {
             header,
         );
 
-        if self.rows.is_empty() {
-            // No data (nothing loaded, empty file, or an error): show the status.
+        if self.has_rows() {
+            self.render_table(frame, body);
+        } else {
             let block = Block::bordered().title(" Results ");
             frame.render_widget(Paragraph::new(self.status.clone()).block(block), body);
-        } else {
-            let header_row = Row::new(
-                self.columns
-                    .iter()
-                    .zip(&self.col_widths)
-                    .map(|(c, w)| Cell::from(truncate_display(c, *w))),
-            )
-            .style(Style::new().bold());
-
-            let body_rows: Vec<Row> = self
-                .rows
-                .iter()
-                .map(|r| {
-                    Row::new(
-                        r.iter()
-                            .zip(&self.col_widths)
-                            .map(|(c, w)| Cell::from(truncate_display(c, *w))),
-                    )
-                })
-                .collect();
-
-            let constraints: Vec<Constraint> =
-                self.col_widths.iter().map(|w| Constraint::Length(*w)).collect();
-            let table = Table::new(body_rows, constraints)
-                .header(header_row)
-                .row_highlight_style(Style::new().reversed())
-                .highlight_symbol("> ")
-                .block(Block::bordered().title(format!(" {} ", self.status)));
-
-            frame.render_stateful_widget(table, body, &mut self.table_state);
         }
 
         // The detail overlay (if open) sits on top of the table.
@@ -175,6 +190,74 @@ impl App {
         frame.render_widget(Paragraph::new(help), footer);
     }
 
+    /// Render only the rows inside the current viewport. Cells are formatted from
+    /// the Arrow columns on demand, so work is bounded by what is on screen.
+    fn render_table(&mut self, frame: &mut Frame, area: Rect) {
+        // Inner height minus the two borders and the header row.
+        let visible = area.height.saturating_sub(3) as usize;
+        self.viewport_rows = visible.max(1);
+        self.clamp_offset();
+
+        let data = self.data.as_ref().expect("has_rows checked before render_table");
+        let formatters = match data.formatters() {
+            Ok(f) => f,
+            Err(err) => {
+                let block = Block::bordered().title(" Results ");
+                frame.render_widget(Paragraph::new(format!("Render error: {err:#}")).block(block), area);
+                return;
+            }
+        };
+
+        let end = (self.offset + self.viewport_rows).min(self.nrows);
+        let rows: Vec<Row> = (self.offset..end)
+            .map(|r| {
+                Row::new(
+                    formatters
+                        .iter()
+                        .zip(&self.col_widths)
+                        .map(|(f, w)| Cell::from(truncate_display(&f.value(r).to_string(), *w)))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+
+        let header_row = Row::new(
+            self.columns
+                .iter()
+                .zip(&self.col_widths)
+                .map(|(c, w)| Cell::from(truncate_display(c, *w)))
+                .collect::<Vec<_>>(),
+        )
+        .style(Style::new().bold());
+
+        let constraints: Vec<Constraint> =
+            self.col_widths.iter().map(|w| Constraint::Length(*w)).collect();
+        let title = format!(" {}  —  row {}/{} ", self.status, self.selected + 1, self.nrows);
+        let table = Table::new(rows, constraints)
+            .header(header_row)
+            .row_highlight_style(Style::new().reversed())
+            .highlight_symbol("> ")
+            .block(Block::bordered().title(title));
+
+        // The table is handed only the visible slice, so the highlighted row is
+        // addressed relative to the current offset.
+        let mut view_state = TableState::default();
+        view_state.select(Some(self.selected - self.offset));
+        frame.render_stateful_widget(table, area, &mut view_state);
+    }
+
+    /// Scroll the viewport so the selected row stays visible.
+    fn clamp_offset(&mut self) {
+        let visible = self.viewport_rows.max(1);
+        if self.selected < self.offset {
+            self.offset = self.selected;
+        } else if self.selected >= self.offset + visible {
+            self.offset = self.selected + 1 - visible;
+        }
+        let max_offset = self.nrows.saturating_sub(visible);
+        self.offset = self.offset.min(max_offset);
+    }
+
     fn handle_events(&mut self) -> Result<()> {
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
@@ -199,14 +282,15 @@ impl App {
     }
 
     fn on_key_table(&mut self, key: KeyEvent) {
+        let page = self.viewport_rows.max(1) as isize;
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit(),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::PageDown => self.move_selection(PAGE_STEP as isize),
-            KeyCode::PageUp => self.move_selection(-(PAGE_STEP as isize)),
+            KeyCode::PageDown => self.move_selection(page),
+            KeyCode::PageUp => self.move_selection(-page),
             KeyCode::Char('g') | KeyCode::Home => self.select(0),
-            KeyCode::Char('G') | KeyCode::End => self.select(self.rows.len().saturating_sub(1)),
+            KeyCode::Char('G') | KeyCode::End => self.select(self.nrows.saturating_sub(1)),
             KeyCode::Enter => self.open_detail(),
             _ => {}
         }
@@ -217,8 +301,8 @@ impl App {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.close_detail(),
             KeyCode::Down | KeyCode::Char('j') => self.detail_scroll_by(1),
             KeyCode::Up | KeyCode::Char('k') => self.detail_scroll_by(-1),
-            KeyCode::PageDown => self.detail_scroll_by(PAGE_STEP as isize),
-            KeyCode::PageUp => self.detail_scroll_by(-(PAGE_STEP as isize)),
+            KeyCode::PageDown => self.detail_scroll_by(DETAIL_PAGE_STEP as isize),
+            KeyCode::PageUp => self.detail_scroll_by(-(DETAIL_PAGE_STEP as isize)),
             KeyCode::Char('g') | KeyCode::Home => self.detail_scroll = 0,
             KeyCode::Char('G') | KeyCode::End => self.detail_scroll = self.detail_max_scroll(),
             _ => {}
@@ -227,29 +311,24 @@ impl App {
 
     /// Move the selection by `delta` rows, clamped to the table bounds.
     fn move_selection(&mut self, delta: isize) {
-        if self.rows.is_empty() {
+        if !self.has_rows() {
             return;
         }
-        let current = self.table_state.selected().unwrap_or(0) as isize;
-        let last = (self.rows.len() - 1) as isize;
-        let next = (current + delta).clamp(0, last) as usize;
-        self.table_state.select(Some(next));
+        let last = (self.nrows - 1) as isize;
+        self.selected = (self.selected as isize + delta).clamp(0, last) as usize;
     }
 
     fn select(&mut self, index: usize) {
-        if self.rows.is_empty() {
+        if !self.has_rows() {
             return;
         }
-        self.table_state.select(Some(index.min(self.rows.len() - 1)));
+        self.selected = index.min(self.nrows - 1);
     }
 
     /// Open the detail overlay for the selected row.
     fn open_detail(&mut self) {
-        if self.rows.is_empty() {
+        if !self.has_rows() {
             return;
-        }
-        if self.table_state.selected().is_none() {
-            self.table_state.select(Some(0));
         }
         self.mode = Mode::Detail;
         self.detail_scroll = 0;
@@ -269,13 +348,14 @@ impl App {
     /// from field widths (exact wrapping depends on the popup size at render).
     fn detail_max_scroll(&self) -> u16 {
         const ASSUMED_WIDTH: usize = 60;
-        let Some(row) = self.table_state.selected().and_then(|i| self.rows.get(i)) else {
+        let Some(data) = self.data.as_ref() else {
             return 0;
         };
+        let row = data.format_row(self.selected).unwrap_or_default();
         let lines: usize = self
             .columns
             .iter()
-            .zip(row)
+            .zip(&row)
             .map(|(name, value)| (name.width() + 2 + value.width()) / ASSUMED_WIDTH + 1)
             .sum();
         lines.saturating_sub(1) as u16
@@ -283,13 +363,13 @@ impl App {
 
     /// Render the selected row's full, untruncated values as a centered overlay.
     fn render_detail(&self, frame: &mut Frame, area: Rect) {
-        let Some((i, row)) = self
-            .table_state
-            .selected()
-            .and_then(|i| self.rows.get(i).map(|r| (i, r)))
-        else {
+        let Some(data) = self.data.as_ref() else {
             return;
         };
+        let row = data.format_row(self.selected).unwrap_or_default();
+        if row.is_empty() {
+            return;
+        }
 
         let popup = centered_rect(area, 80, 80);
         frame.render_widget(Clear, popup);
@@ -297,7 +377,7 @@ impl App {
         let lines: Vec<Line> = self
             .columns
             .iter()
-            .zip(row)
+            .zip(&row)
             .map(|(name, value)| {
                 Line::from(vec![
                     Span::styled(format!("{name}: "), Style::new().fg(Color::Cyan).bold()),
@@ -306,7 +386,7 @@ impl App {
             })
             .collect();
 
-        let title = format!(" Row {} / {} — Esc to close ", i + 1, self.rows.len());
+        let title = format!(" Row {} / {} — Esc to close ", self.selected + 1, self.nrows);
         let detail = Paragraph::new(Text::from(lines))
             .block(Block::bordered().title(title))
             .wrap(Wrap { trim: false })
@@ -327,6 +407,11 @@ fn key(label: &str) -> Span<'_> {
     )
 }
 
+/// Clamp a measured display width into the allowed column-width range.
+fn clamp_width(w: usize) -> u16 {
+    w.clamp(MIN_COL_WIDTH as usize, MAX_COL_WIDTH as usize) as u16
+}
+
 /// A rectangle centered within `area`, sized to the given percentages of it.
 fn centered_rect(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
     let width = area.width * pct_x / 100;
@@ -337,25 +422,6 @@ fn centered_rect(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
         width,
         height,
     }
-}
-
-/// Measure a display width (terminal cells) per column from the header plus a
-/// sample of rows. Uses Unicode display width so full-width characters count
-/// as 2, matching how the terminal renders them.
-fn column_widths(columns: &[String], rows: &[Vec<String>]) -> Vec<u16> {
-    columns
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            let mut width = name.width();
-            for row in rows.iter().take(WIDTH_SAMPLE_ROWS) {
-                if let Some(cell) = row.get(i) {
-                    width = width.max(cell.width());
-                }
-            }
-            (width as u16).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH)
-        })
-        .collect()
 }
 
 /// Truncate `s` to at most `max` display cells, appending `…` when it is cut.
@@ -439,6 +505,29 @@ mod render_tests {
         assert!(
             out.contains("description"),
             "detail overlay should show the full value:\n{out}"
+        );
+    }
+
+    #[test]
+    fn viewport_renders_only_visible_rows() {
+        // A 1000-row synthetic table: only the on-screen slice is rendered.
+        let mut app = App::from_demo(1000);
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+
+        terminal.draw(|f| app.render(f)).unwrap();
+        let top = format!("{}", terminal.backend());
+        assert!(top.contains("item-0"), "top of the table should render:\n{top}");
+        assert!(
+            !top.contains("item-999"),
+            "the last row must not render while scrolled to the top"
+        );
+
+        app.select(999);
+        terminal.draw(|f| app.render(f)).unwrap();
+        let bottom = format!("{}", terminal.backend());
+        assert!(
+            bottom.contains("item-999"),
+            "scrolling to the end should reveal the last row:\n{bottom}"
         );
     }
 }
