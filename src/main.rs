@@ -1,4 +1,5 @@
 mod app;
+mod data;
 
 use app::App;
 use clap::Parser;
@@ -22,12 +23,12 @@ fn main() -> Result<()> {
     // top, so install color_eyre first, then init ratatui.
     color_eyre::install()?;
 
-    let _cli = Cli::parse();
+    let cli = Cli::parse();
 
     // Switch the terminal into raw mode + alternate screen, and always restore
     // it on exit.
     let terminal = ratatui::init();
-    let result = App::new().run(terminal);
+    let result = App::new(cli.path).run(terminal);
     ratatui::restore();
     result
 }

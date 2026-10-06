@@ -16,3 +16,7 @@ ratatui = "0.30"
 clap = { version = "4", features = ["derive"] }
 # Error handling + readable panic/error reports.
 color-eyre = "0.6"
+# Columnar in-memory data: holds result rows and formats cells for display.
+# `csv` enables the CSV reader; the Parquet reader lives in the `parquet` crate.
+arrow = { version = "60", features = ["csv"] }
+parquet = { version = "60", features = ["arrow"] }

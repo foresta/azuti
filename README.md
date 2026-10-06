@@ -20,7 +20,7 @@ romanization.
 | Step | Scope | Status |
 |---|---|---|
 | a | CLI scaffold + TUI skeleton | ✅ |
-| b | Show local data (CSV / Parquet) | — |
+| b | Show local data (CSV / Parquet) | ✅ |
 | c | Fast table over synthetic data (Arrow + viewport rendering) | — |
 | d | Connect to Snowflake (key-pair / JWT first, SSO later) | — |
 
@@ -30,11 +30,24 @@ romanization.
 # First time only: install the Rust toolchain
 # curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
+# Open a local file (CSV or Parquet)
+cargo run -- testdata/sample.csv
+
+# Or start empty
 cargo run
 ```
 
-On start you get a three-row layout (header / results area / key hints). Press
-`q`, `Esc`, or `Ctrl-C` to quit.
+On start you get a three-row layout (header / results table / key hints).
+
+| Key | Action |
+|---|---|
+| `↑` / `↓`, `j` / `k` | Move selection |
+| `PageUp` / `PageDown` | Move by a page |
+| `g` / `G` | Jump to top / bottom |
+| `q`, `Esc`, `Ctrl-C` | Quit |
+
+Supported input formats: **CSV** (header row inferred) and **Parquet**. Errors
+(missing file, bad format) are shown in the results area instead of crashing.
 
 ## Stack
 
