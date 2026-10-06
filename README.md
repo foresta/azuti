@@ -44,15 +44,16 @@ On start you get a three-row layout (header / results table / key hints).
 | `↑` / `↓`, `j` / `k` | Move selection |
 | `PageUp` / `PageDown` | Move by a page |
 | `g` / `G` | Jump to top / bottom |
+| `Enter` | Open the full-value detail view for the selected row (`Esc` to close) |
 | `q`, `Esc`, `Ctrl-C` | Quit |
 
 Supported input formats: **CSV** (header row inferred) and **Parquet**. Errors
 (missing file, bad format) are shown in the results area instead of crashing.
 
 Cells wider than their column are clipped with a `…`, and column widths are
-measured in terminal cells so full-width (e.g. CJK) text aligns correctly. Very
-wide tables do not scroll horizontally yet — that and a full-cell detail view are
-tracked as follow-ups.
+measured in terminal cells so full-width (e.g. CJK) text aligns correctly. Press
+`Enter` to open a detail view with the selected row's full, untruncated values.
+Very wide tables do not scroll horizontally yet (tracked as a follow-up).
 
 ## Stack
 

@@ -4,10 +4,10 @@ use std::time::Duration;
 use color_eyre::Result;
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Style, Stylize},
-    text::{Line, Span},
-    widgets::{Block, Cell, Paragraph, Row, Table, TableState},
+    text::{Line, Span, Text},
+    widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
     DefaultTerminal, Frame,
 };
 
@@ -24,6 +24,16 @@ const MAX_COL_WIDTH: u16 = 40;
 /// How many rows Page Up / Page Down moves the selection.
 const PAGE_STEP: usize = 20;
 
+/// Which view currently has focus.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The results table.
+    #[default]
+    Table,
+    /// A full-value overlay for the selected row.
+    Detail,
+}
+
 /// Top-level application state.
 #[derive(Debug, Default)]
 pub struct App {
@@ -39,6 +49,10 @@ pub struct App {
     table_state: TableState,
     /// One-line status shown as the table title (load result or error).
     status: String,
+    /// Current view (table or the row-detail overlay).
+    mode: Mode,
+    /// Vertical scroll offset within the detail overlay.
+    detail_scroll: u16,
 }
 
 impl App {
@@ -132,14 +146,32 @@ impl App {
             frame.render_stateful_widget(table, body, &mut self.table_state);
         }
 
-        let help = Line::from(vec![
-            key(" ↑/↓ j/k "),
-            Span::raw(" move  "),
-            key(" g/G "),
-            Span::raw(" top/bottom  "),
-            key(" q "),
-            Span::raw(" quit "),
-        ]);
+        // The detail overlay (if open) sits on top of the table.
+        if self.mode == Mode::Detail {
+            let full = frame.area();
+            self.render_detail(frame, full);
+        }
+
+        let help = match self.mode {
+            Mode::Table => Line::from(vec![
+                key(" ↑/↓ j/k "),
+                Span::raw(" move  "),
+                key(" g/G "),
+                Span::raw(" top/bottom  "),
+                key(" Enter "),
+                Span::raw(" details  "),
+                key(" q "),
+                Span::raw(" quit "),
+            ]),
+            Mode::Detail => Line::from(vec![
+                key(" ↑/↓ j/k "),
+                Span::raw(" scroll  "),
+                key(" g/G "),
+                Span::raw(" top/bottom  "),
+                key(" Esc "),
+                Span::raw(" close "),
+            ]),
+        };
         frame.render_widget(Paragraph::new(help), footer);
     }
 
@@ -155,15 +187,40 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        // Ctrl-C always quits, in any mode.
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.quit();
+            return;
+        }
+        match self.mode {
+            Mode::Table => self.on_key_table(key),
+            Mode::Detail => self.on_key_detail(key),
+        }
+    }
+
+    fn on_key_table(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit(),
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit(),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::PageDown => self.move_selection(PAGE_STEP as isize),
             KeyCode::PageUp => self.move_selection(-(PAGE_STEP as isize)),
             KeyCode::Char('g') | KeyCode::Home => self.select(0),
             KeyCode::Char('G') | KeyCode::End => self.select(self.rows.len().saturating_sub(1)),
+            KeyCode::Enter => self.open_detail(),
+            _ => {}
+        }
+    }
+
+    fn on_key_detail(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.close_detail(),
+            KeyCode::Down | KeyCode::Char('j') => self.detail_scroll_by(1),
+            KeyCode::Up | KeyCode::Char('k') => self.detail_scroll_by(-1),
+            KeyCode::PageDown => self.detail_scroll_by(PAGE_STEP as isize),
+            KeyCode::PageUp => self.detail_scroll_by(-(PAGE_STEP as isize)),
+            KeyCode::Char('g') | KeyCode::Home => self.detail_scroll = 0,
+            KeyCode::Char('G') | KeyCode::End => self.detail_scroll = self.detail_max_scroll(),
             _ => {}
         }
     }
@@ -186,6 +243,77 @@ impl App {
         self.table_state.select(Some(index.min(self.rows.len() - 1)));
     }
 
+    /// Open the detail overlay for the selected row.
+    fn open_detail(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+        if self.table_state.selected().is_none() {
+            self.table_state.select(Some(0));
+        }
+        self.mode = Mode::Detail;
+        self.detail_scroll = 0;
+    }
+
+    fn close_detail(&mut self) {
+        self.mode = Mode::Table;
+    }
+
+    fn detail_scroll_by(&mut self, delta: isize) {
+        let max = self.detail_max_scroll() as isize;
+        let next = (self.detail_scroll as isize + delta).clamp(0, max);
+        self.detail_scroll = next as u16;
+    }
+
+    /// Rough upper bound on how far the detail overlay can scroll, estimated
+    /// from field widths (exact wrapping depends on the popup size at render).
+    fn detail_max_scroll(&self) -> u16 {
+        const ASSUMED_WIDTH: usize = 60;
+        let Some(row) = self.table_state.selected().and_then(|i| self.rows.get(i)) else {
+            return 0;
+        };
+        let lines: usize = self
+            .columns
+            .iter()
+            .zip(row)
+            .map(|(name, value)| (name.width() + 2 + value.width()) / ASSUMED_WIDTH + 1)
+            .sum();
+        lines.saturating_sub(1) as u16
+    }
+
+    /// Render the selected row's full, untruncated values as a centered overlay.
+    fn render_detail(&self, frame: &mut Frame, area: Rect) {
+        let Some((i, row)) = self
+            .table_state
+            .selected()
+            .and_then(|i| self.rows.get(i).map(|r| (i, r)))
+        else {
+            return;
+        };
+
+        let popup = centered_rect(area, 80, 80);
+        frame.render_widget(Clear, popup);
+
+        let lines: Vec<Line> = self
+            .columns
+            .iter()
+            .zip(row)
+            .map(|(name, value)| {
+                Line::from(vec![
+                    Span::styled(format!("{name}: "), Style::new().fg(Color::Cyan).bold()),
+                    Span::raw(value.clone()),
+                ])
+            })
+            .collect();
+
+        let title = format!(" Row {} / {} — Esc to close ", i + 1, self.rows.len());
+        let detail = Paragraph::new(Text::from(lines))
+            .block(Block::bordered().title(title))
+            .wrap(Wrap { trim: false })
+            .scroll((self.detail_scroll, 0));
+        frame.render_widget(detail, popup);
+    }
+
     fn quit(&mut self) {
         self.running = false;
     }
@@ -197,6 +325,18 @@ fn key(label: &str) -> Span<'_> {
         label.to_string(),
         Style::new().fg(Color::Black).bg(Color::Gray),
     )
+}
+
+/// A rectangle centered within `area`, sized to the given percentages of it.
+fn centered_rect(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
+    let width = area.width * pct_x / 100;
+    let height = area.height * pct_y / 100;
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
 }
 
 /// Measure a display width (terminal cells) per column from the header plus a
@@ -280,5 +420,25 @@ mod render_tests {
         assert_eq!(truncate_display("hello world", 8), "hello w…");
         // Each CJK char is 2 cells: width 5 fits two chars (4) + ellipsis (1).
         assert_eq!(truncate_display("あいうえお", 5), "あい…");
+    }
+
+    #[test]
+    fn detail_overlay_shows_untruncated_value() {
+        let full = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/long_text.csv");
+        let mut app = App::new(Some(full));
+        app.select(2); // the row with the very long note
+        app.open_detail();
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let out = format!("{}", terminal.backend());
+
+        // "description" sits past the 40-cell table cap, so it only appears when
+        // the full value is shown in the detail overlay.
+        assert!(
+            out.contains("description"),
+            "detail overlay should show the full value:\n{out}"
+        );
     }
 }
