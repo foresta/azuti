@@ -146,12 +146,12 @@ impl App {
     /// Build the app in interactive mode: a SQL editor backed by a query engine.
     pub fn interactive(engine: QueryEngine) -> Self {
         let mut editor = TextArea::default();
-        editor.set_placeholder_text("SELECT …   (F5 to run)");
+        editor.set_placeholder_text("SELECT …   (Ctrl+Enter or Ctrl+R to run)");
         App {
             editor: Some(editor),
             engine: Some(engine),
             focus: Focus::Editor,
-            status: "Write a query and press F5".to_string(),
+            status: "Write a query and press Ctrl+Enter (or Ctrl+R)".to_string(),
             ..Default::default()
         }
     }
@@ -262,7 +262,7 @@ impl App {
             let border = if focused { Color::Blue } else { Color::DarkGray };
             editor.set_block(
                 Block::bordered()
-                    .title(" SQL — F5 to run ")
+                    .title(" SQL — Ctrl+Enter / Ctrl+R to run ")
                     .border_style(Style::new().fg(border)),
             );
             frame.render_widget(&*editor, top);
@@ -303,7 +303,9 @@ impl App {
         }
         if self.editor.is_some() && self.focus == Focus::Editor {
             return Line::from(vec![
-                key(" F5 "),
+                key(" Ctrl+Enter "),
+                Span::raw(" / "),
+                key(" Ctrl+R "),
                 Span::raw(" run  "),
                 key(" Tab "),
                 Span::raw(" results  "),
@@ -528,9 +530,12 @@ impl App {
     }
 
     fn on_key_editor(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::F(5) => self.run_query(),
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => self.run_query(),
+            // Ctrl+Enter runs on terminals that can report it (needs the keyboard
+            // enhancement protocol); Ctrl+R runs on every terminal.
+            KeyCode::Enter if ctrl => self.run_query(),
+            KeyCode::Char('r') if ctrl => self.run_query(),
             KeyCode::Tab | KeyCode::Esc => self.focus = Focus::Results,
             _ => {
                 if let Some(editor) = &mut self.editor {
@@ -857,7 +862,7 @@ mod render_tests {
         let mut app = App {
             editor: Some(TextArea::default()),
             focus: Focus::Editor,
-            status: "Write a query and press F5".to_string(),
+            status: "Write a query".to_string(),
             ..Default::default()
         };
 
@@ -866,7 +871,7 @@ mod render_tests {
         let out = format!("{}", terminal.backend());
 
         assert!(out.contains("SQL"), "editor pane should be labelled:\n{out}");
-        assert!(out.contains("F5"), "footer should show the run hint:\n{out}");
+        assert!(out.contains("Ctrl+R"), "footer should show the run hint:\n{out}");
     }
 
     #[test]

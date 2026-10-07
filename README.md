@@ -76,9 +76,14 @@ file the `snow` CLI uses).
 cargo run -- --connection default
 ```
 
-Type SQL and press **F5** to run; results fill the table below. `Tab` switches
-focus between the editor and the results; in the results the usual keys work
-(`j`/`k`, `←`/`→`, `Enter` for the detail view). `Ctrl-C` quits.
+Type SQL and press **Ctrl+Enter** (or **Ctrl+R**) to run; results fill the table
+below. `Tab` switches focus between the editor and the results; in the results
+the usual keys work (`j`/`k`, `←`/`→`, `Enter` for the detail view). `Ctrl-C`
+quits.
+
+> `Ctrl+Enter` only reaches the app on terminals that support the keyboard
+> enhancement protocol (e.g. Kitty, WezTerm, Ghostty, recent iTerm2). Everywhere
+> else it reads as a newline — use `Ctrl+R`, which always works.
 
 **One-shot** — run a single query and show the result:
 

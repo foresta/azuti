@@ -193,7 +193,37 @@ fn main() -> Result<()> {
     // Switch the terminal into raw mode + alternate screen, and always restore
     // it on exit.
     let terminal = ratatui::init();
+    // Ask the terminal to report modified keys (so Ctrl+Enter is distinguishable
+    // from Enter); a no-op on terminals that do not support it.
+    let enhanced = enable_keyboard_enhancement();
     let result = app.run(terminal);
+    if enhanced {
+        disable_keyboard_enhancement();
+    }
     ratatui::restore();
     result
+}
+
+/// Enable the keyboard enhancement protocol if the terminal supports it, so keys
+/// like Ctrl+Enter are reported distinctly. Returns whether it was enabled.
+fn enable_keyboard_enhancement() -> bool {
+    use ratatui::crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+    use ratatui::crossterm::execute;
+    use ratatui::crossterm::terminal::supports_keyboard_enhancement;
+
+    if supports_keyboard_enhancement().unwrap_or(false) {
+        execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok()
+    } else {
+        false
+    }
+}
+
+fn disable_keyboard_enhancement() {
+    use ratatui::crossterm::event::PopKeyboardEnhancementFlags;
+    use ratatui::crossterm::execute;
+    let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
 }
