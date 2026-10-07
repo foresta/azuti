@@ -67,7 +67,20 @@ the title mark columns hidden off the left / right edge.
 
 ## Snowflake
 
-Run a query against Snowflake with key-pair (JWT) auth and browse the result:
+Run a query against Snowflake with key-pair (JWT) auth and browse the result.
+
+Using `~/.snowflake/connections.toml` (the same file the `snow` CLI uses):
+
+```sh
+# Uses the [default] connection
+cargo run -- --sql "SELECT * FROM my_db.my_schema.my_table LIMIT 10000"
+
+# Or a named connection
+cargo run -- --sql "SELECT ..." --connection my_conn
+```
+
+Any explicit flag overrides the value from connections.toml. To skip the file
+entirely and pass everything on the command line:
 
 ```sh
 cargo run -- \
@@ -77,6 +90,9 @@ cargo run -- \
   --private-key ~/.snowflake/rsa_key.p8 \
   --warehouse WH --database MY_DB --schema MY_SCHEMA --role MY_READONLY_ROLE
 ```
+
+The connections file is found via `$SNOWFLAKE_HOME` or `~/.snowflake`, or set it
+with `--connections-file`.
 
 The query runs once at startup; connection or SQL errors are printed to the
 terminal (not inside the TUI). Results come back as Arrow and flow into the same

@@ -7,7 +7,7 @@ use clap::Parser;
 use color_eyre::eyre::{bail, Result};
 
 use crate::data::DataTable;
-use crate::snowflake::SnowflakeParams;
+use crate::snowflake::{ConnConfig, SnowflakeParams};
 
 /// azuti — a fast terminal (TUI) data viewer.
 ///
@@ -49,26 +49,86 @@ struct Cli {
     /// Role to assume (use a read-only role for viewing).
     #[arg(long)]
     role: Option<String>,
+
+    /// Use a named connection from Snowflake's connections.toml. Explicit flags
+    /// above override its values.
+    #[arg(long, value_name = "NAME")]
+    connection: Option<String>,
+    /// Path to connections.toml (default: $SNOWFLAKE_HOME or
+    /// ~/.snowflake/connections.toml).
+    #[arg(long, value_name = "PATH")]
+    connections_file: Option<std::path::PathBuf>,
 }
 
 impl Cli {
-    /// Assemble Snowflake connection parameters, erroring if a required one is
-    /// missing.
+    /// Assemble Snowflake connection parameters from connections.toml (if any)
+    /// overlaid with explicit flags, erroring if a required one is still missing.
     fn snowflake_params(&self) -> Result<SnowflakeParams> {
-        let (Some(account), Some(user), Some(private_key)) =
-            (&self.account, &self.user, &self.private_key)
+        let base = self.load_base_connection()?;
+        let from_base = |pick: fn(&ConnConfig) -> Option<String>| base.as_ref().and_then(pick);
+
+        let account = self.account.clone().or_else(|| from_base(|b| b.account.clone()));
+        let user = self.user.clone().or_else(|| from_base(|b| b.user.clone()));
+        let private_key_path = self
+            .private_key
+            .clone()
+            .or_else(|| base.as_ref().and_then(|b| b.private_key()));
+
+        // Point SSO/OAuth connections at the supported auth rather than a vague
+        // "missing private key" error.
+        if private_key_path.is_none() {
+            if let Some(auth) = base.as_ref().and_then(|b| b.authenticator.as_deref()) {
+                let a = auth.to_ascii_lowercase();
+                if a.contains("externalbrowser") || a.contains("oauth") {
+                    bail!("connection uses '{auth}' auth; azuti only supports key-pair (JWT) for now");
+                }
+            }
+        }
+
+        let (Some(account), Some(user), Some(private_key_path)) = (account, user, private_key_path)
         else {
-            bail!("--sql requires --account, --user and --private-key for key-pair auth");
+            bail!(
+                "missing Snowflake connection details: need account, user and a private key \
+                 (via --connection, connections.toml, or --account/--user/--private-key)"
+            );
         };
+
         Ok(SnowflakeParams {
-            account: account.clone(),
-            user: user.clone(),
-            private_key_path: private_key.clone(),
-            warehouse: self.warehouse.clone(),
-            database: self.database.clone(),
-            schema: self.schema.clone(),
-            role: self.role.clone(),
+            account,
+            user,
+            private_key_path,
+            warehouse: self.warehouse.clone().or_else(|| from_base(|b| b.warehouse.clone())),
+            database: self.database.clone().or_else(|| from_base(|b| b.database.clone())),
+            schema: self.schema.clone().or_else(|| from_base(|b| b.schema.clone())),
+            role: self.role.clone().or_else(|| from_base(|b| b.role.clone())),
         })
+    }
+
+    /// Load the base connection from connections.toml: the `--connection` name if
+    /// given, otherwise the `default` connection when no explicit credentials
+    /// were passed and the file exists.
+    fn load_base_connection(&self) -> Result<Option<ConnConfig>> {
+        let file = self
+            .connections_file
+            .clone()
+            .or_else(snowflake::default_connections_file);
+
+        match (&self.connection, file) {
+            (Some(name), Some(file)) => Ok(Some(snowflake::load_connection(&file, name)?)),
+            (Some(name), None) => {
+                bail!("--connection {name} given but no connections.toml path could be determined")
+            }
+            (None, Some(file))
+                if self.account.is_none()
+                    && self.user.is_none()
+                    && self.private_key.is_none()
+                    && file.exists() =>
+            {
+                // Fall back to the `default` connection, ignoring it if absent.
+                Ok(snowflake::load_connection(&file, "default").ok())
+            }
+            _ => Ok(None),
+        }
     }
 }
 
