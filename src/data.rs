@@ -3,20 +3,20 @@ use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
+use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::compute::concat_batches;
 use arrow::csv::reader::Format;
 use arrow::csv::ReaderBuilder;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use color_eyre::eyre::{bail, Context, Result};
+use unicode_width::UnicodeWidthStr;
 
-/// A table loaded from a local file: a schema plus all rows as a single Arrow
-/// `RecordBatch`.
+/// A table loaded from a local file or generated synthetically: a schema plus
+/// all rows as a single Arrow `RecordBatch`.
 ///
-/// For step b we keep the data as Arrow but format every cell up front (see
-/// [`DataTable::to_string_rows`]). That is the naive baseline; step c replaces
-/// it with viewport rendering that formats only the cells currently on screen.
+/// Cells are formatted to text on demand (see [`DataTable::formatters`]), so the
+/// view can render just the rows currently on screen.
 #[derive(Debug)]
 pub struct DataTable {
     schema: SchemaRef,
@@ -60,27 +60,74 @@ impl DataTable {
         self.batch.num_columns()
     }
 
-    /// Format the whole table into rows of owned strings.
-    ///
-    /// One [`ArrayFormatter`] per column (type-erased, created once), then each
-    /// cell is formatted by row index. Naive for step b; step c formats only the
-    /// visible window.
-    pub fn to_string_rows(&self) -> Result<Vec<Vec<String>>> {
+    /// Build one [`ArrayFormatter`] per column. The formatters borrow the
+    /// underlying Arrow arrays, so cells are rendered to text on demand without
+    /// copying the column data — this is what makes viewport rendering cheap.
+    pub fn formatters(&self) -> Result<Vec<ArrayFormatter<'_>>> {
         let options = FormatOptions::default().with_null("");
-        let formatters: Vec<ArrayFormatter> = self
-            .batch
+        self.batch
             .columns()
             .iter()
             .map(|c| ArrayFormatter::try_new(c.as_ref(), &options))
             .collect::<std::result::Result<_, _>>()
-            .wrap_err("building column formatters")?;
+            .wrap_err("building column formatters")
+    }
 
-        let mut rows = Vec::with_capacity(self.batch.num_rows());
-        for r in 0..self.batch.num_rows() {
-            let row = formatters.iter().map(|f| f.value(r).to_string()).collect();
-            rows.push(row);
+    /// Format a single row across all columns. Used for the detail overlay.
+    pub fn format_row(&self, row: usize) -> Result<Vec<String>> {
+        if row >= self.num_rows() {
+            return Ok(Vec::new());
         }
-        Ok(rows)
+        let formatters = self.formatters()?;
+        Ok(formatters
+            .iter()
+            .map(|f| f.value(row).to_string())
+            .collect())
+    }
+
+    /// Maximum display width (terminal cells) per column, measured from the
+    /// header name plus the first `sample` rows. Only the sample is scanned so
+    /// this stays cheap on large tables.
+    pub fn column_display_widths(&self, sample: usize) -> Result<Vec<usize>> {
+        let formatters = self.formatters()?;
+        let mut widths: Vec<usize> = self.column_names().iter().map(|n| n.width()).collect();
+        let scan = self.num_rows().min(sample);
+        for r in 0..scan {
+            for (c, f) in formatters.iter().enumerate() {
+                let w = f.value(r).to_string().width();
+                if w > widths[c] {
+                    widths[c] = w;
+                }
+            }
+        }
+        Ok(widths)
+    }
+
+    /// Build a synthetic table of `nrows` rows for stress-testing the viewer.
+    pub fn demo(nrows: usize) -> Self {
+        let ids = Int64Array::from_iter_values(0..nrows as i64);
+        let names = StringArray::from_iter_values((0..nrows).map(|i| format!("item-{i}")));
+        const CATS: [&str; 4] = ["alpha", "beta", "gamma", "delta"];
+        let categories = StringArray::from_iter_values((0..nrows).map(|i| CATS[i % CATS.len()]));
+        let values = Float64Array::from_iter_values((0..nrows).map(|i| i as f64 * 1.5));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(ids),
+                Arc::new(names),
+                Arc::new(categories),
+                Arc::new(values),
+            ],
+        )
+        .expect("synthetic columns match the schema");
+        Self { schema, batch }
     }
 }
 
@@ -144,9 +191,9 @@ mod tests {
             ["id", "name", "role", "city", "score"]
         );
 
-        let rows = table.to_string_rows().unwrap();
-        assert_eq!(rows.len(), 10);
-        assert_eq!(rows[0][1], "Ada Lovelace");
+        let row0 = table.format_row(0).unwrap();
+        assert_eq!(row0.len(), 5);
+        assert_eq!(row0[1], "Ada Lovelace");
     }
 
     #[test]

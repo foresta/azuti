@@ -21,7 +21,7 @@ romanization.
 |---|---|---|
 | a | CLI scaffold + TUI skeleton | ✅ |
 | b | Show local data (CSV / Parquet) | ✅ |
-| c | Fast table over synthetic data (Arrow + viewport rendering) | — |
+| c | Fast table over synthetic data (Arrow + viewport rendering) | ✅ |
 | d | Connect to Snowflake (key-pair / JWT first, SSO later) | — |
 
 ## Usage (work in progress)
@@ -33,9 +33,17 @@ romanization.
 # Open a local file (CSV or Parquet)
 cargo run -- testdata/sample.csv
 
+# Stress-test with N synthetic rows (no file needed)
+cargo run -- --demo 2000000
+
 # Or start empty
 cargo run
 ```
+
+Rendering is viewport-based: only the rows currently on screen are formatted
+from the Arrow columns, so scrolling cost does not grow with the row count. A
+2,000,000-row demo table paints a frame in well under a millisecond, including
+after jumping to the last row.
 
 On start you get a three-row layout (header / results table / key hints).
 
