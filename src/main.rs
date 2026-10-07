@@ -1,5 +1,6 @@
 mod app;
 mod data;
+mod query;
 mod snowflake;
 
 use app::App;
@@ -7,6 +8,7 @@ use clap::Parser;
 use color_eyre::eyre::{bail, Result};
 
 use crate::data::DataTable;
+use crate::query::QueryEngine;
 use crate::snowflake::{ConnConfig, SnowflakeParams};
 
 /// azuti — a fast terminal (TUI) data viewer.
@@ -130,13 +132,23 @@ impl Cli {
             _ => Ok(None),
         }
     }
+
+    /// Whether the user asked for a Snowflake connection at all.
+    fn has_snowflake_intent(&self) -> bool {
+        self.connection.is_some()
+            || self.account.is_some()
+            || self.user.is_some()
+            || self.private_key.is_some()
+    }
 }
 
 /// Decide what to show, running the Snowflake query (if any) before the TUI
 /// starts so errors print normally instead of inside the alternate screen.
 fn build_app(cli: Cli) -> Result<App> {
     if let Some(sql) = &cli.sql {
+        // One-shot: run the query now and show the result.
         let params = cli.snowflake_params()?;
+        warn_if_region_locator(&params);
         let batches = snowflake::run_query(&params, sql)?;
         let data = DataTable::from_batches(batches)?;
         let status = format!(
@@ -145,10 +157,28 @@ fn build_app(cli: Cli) -> Result<App> {
             data.num_cols()
         );
         Ok(App::from_table(data, status))
+    } else if cli.has_snowflake_intent() {
+        // Interactive: open the SQL editor connected to Snowflake.
+        let params = cli.snowflake_params()?;
+        warn_if_region_locator(&params);
+        Ok(App::interactive(QueryEngine::spawn(params)))
     } else if let Some(rows) = cli.demo {
         Ok(App::from_demo(rows))
     } else {
         Ok(App::new(cli.path))
+    }
+}
+
+/// Key-pair auth puts the account into the JWT, where Snowflake rejects a
+/// region/cloud suffix. A dotted account is almost always a region locator.
+fn warn_if_region_locator(params: &SnowflakeParams) {
+    if params.account.contains('.') {
+        eprintln!(
+            "warning: account '{}' looks like a region locator; key-pair (JWT) auth needs the \
+             organization account identifier (e.g. ORG-ACCOUNT). Find it with: \
+             snow sql -q \"SELECT CURRENT_ORGANIZATION_NAME(), CURRENT_ACCOUNT_NAME()\"",
+            params.account
+        );
     }
 }
 
