@@ -258,7 +258,9 @@ impl App {
                 .map(|(c, w)| Cell::from(truncate_display(c, *w)))
                 .collect::<Vec<_>>(),
         )
-        .style(Style::new().bold());
+        // Give the header a filled bar so it reads clearly apart from the data
+        // rows (and from the reversed selection highlight).
+        .style(Style::new().bold().fg(Color::White).bg(Color::Blue));
 
         let constraints: Vec<Constraint> = self.col_widths[cols.clone()]
             .iter()
@@ -649,6 +651,26 @@ mod render_tests {
         assert!(
             out.contains("item-999999"),
             "a wide value scrolled into view must not be clipped:\n{out}"
+        );
+    }
+
+    #[test]
+    fn header_row_is_visually_distinct() {
+        let full = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/sample.csv");
+        let mut app = App::new(Some(full));
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        // y0 is the title bar, y1 the top border, y2 the header row, y3 data.
+        assert!(
+            (1u16..59).all(|x| buf[(x, 2)].style().bg == Some(Color::Blue)),
+            "header row should be a filled bar"
+        );
+        assert!(
+            (1u16..59).all(|x| buf[(x, 3)].style().bg != Some(Color::Blue)),
+            "data rows should not share the header's fill"
         );
     }
 
