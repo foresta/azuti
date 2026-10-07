@@ -102,6 +102,10 @@ Notes:
 
 - Prefer a **read-only role** for viewing — Snowflake has no app-enforced
   read-only mode, so access is controlled by the role you connect with.
+- For key-pair auth, set `account` to the **organization account identifier**
+  (e.g. `MYORG-MYACCOUNT`), not the region locator
+  (`xy12345.ap-northeast-1.aws`): the region suffix makes the JWT invalid. Find
+  yours with `snow sql -q "SELECT CURRENT_ORGANIZATION_NAME(), CURRENT_ACCOUNT_NAME()"`.
 - The private key must be an **unencrypted PEM** (PKCS#8) for now.
 - Connectivity uses [`snowflake-api`](https://crates.io/crates/snowflake-api),
   which talks to Snowflake's HTTPS API; `arrow` is pinned to the version it uses.
