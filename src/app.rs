@@ -13,7 +13,11 @@ use ratatui::{
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use arrow::array::RecordBatch;
+use tui_textarea::TextArea;
+
 use crate::data::DataTable;
+use crate::query::QueryEngine;
 
 /// Rows beyond this are not scanned when measuring column widths (keeps load
 /// cheap on large tables).
@@ -23,6 +27,8 @@ const MIN_COL_WIDTH: u16 = 3;
 const MAX_COL_WIDTH: u16 = 40;
 /// How many lines Page Up / Page Down moves inside the detail overlay.
 const DETAIL_PAGE_STEP: usize = 20;
+/// Height (rows) of the SQL editor pane in interactive mode.
+const EDITOR_HEIGHT: u16 = 8;
 
 /// Which view currently has focus.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +38,16 @@ enum Mode {
     Table,
     /// A full-value overlay for the selected row.
     Detail,
+}
+
+/// Which pane has keyboard focus in interactive mode.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    /// The results table.
+    #[default]
+    Results,
+    /// The SQL editor.
+    Editor,
 }
 
 /// Top-level application state.
@@ -65,6 +81,12 @@ pub struct App {
     mode: Mode,
     /// Vertical scroll offset within the detail overlay.
     detail_scroll: u16,
+    /// SQL editor, present only in interactive mode.
+    editor: Option<TextArea<'static>>,
+    /// Background query worker, present only in interactive mode.
+    engine: Option<QueryEngine>,
+    /// Which pane has focus (interactive mode).
+    focus: Focus,
 }
 
 impl App {
@@ -113,43 +135,103 @@ impl App {
     }
 
     fn loaded(data: DataTable, status: String) -> Self {
-        let columns = data.column_names();
-        let nrows = data.num_rows();
-        let col_widths = data
-            .column_display_widths(WIDTH_SAMPLE_ROWS)
-            .map(|ws| ws.into_iter().map(clamp_width).collect())
-            .unwrap_or_else(|_| columns.iter().map(|_| MIN_COL_WIDTH).collect());
-
-        App {
-            columns,
-            col_widths,
-            nrows,
+        let mut app = App {
             status,
-            data: Some(data),
+            ..Default::default()
+        };
+        app.apply_table(data);
+        app
+    }
+
+    /// Build the app in interactive mode: a SQL editor backed by a query engine.
+    pub fn interactive(engine: QueryEngine) -> Self {
+        let mut editor = TextArea::default();
+        editor.set_placeholder_text("SELECT …   (F5 to run)");
+        App {
+            editor: Some(editor),
+            engine: Some(engine),
+            focus: Focus::Editor,
+            status: "Write a query and press F5".to_string(),
             ..Default::default()
         }
+    }
+
+    /// Replace the current table with `data`, resetting scroll and selection.
+    fn apply_table(&mut self, data: DataTable) {
+        self.columns = data.column_names();
+        self.nrows = data.num_rows();
+        self.col_widths = data
+            .column_display_widths(WIDTH_SAMPLE_ROWS)
+            .map(|ws| ws.into_iter().map(clamp_width).collect())
+            .unwrap_or_else(|_| self.columns.iter().map(|_| MIN_COL_WIDTH).collect());
+        self.selected = 0;
+        self.offset = 0;
+        self.col_offset = 0;
+        self.data = Some(data);
     }
 
     fn has_rows(&self) -> bool {
         self.data.is_some() && self.nrows > 0
     }
 
-    /// Main loop: draw, then handle input, repeated while `running` is set.
+    /// Main loop: draw, handle input, then apply any finished query.
     pub fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
         self.running = true;
         while self.running {
             terminal.draw(|frame| self.render(frame))?;
             self.handle_events()?;
+            self.poll_query();
         }
         Ok(())
     }
 
-    /// Render a single frame: header / body / footer.
+    /// Check the query engine for a finished result and apply it.
+    fn poll_query(&mut self) {
+        let Some(engine) = &self.engine else {
+            return;
+        };
+        if let Some(outcome) = engine.poll() {
+            match outcome {
+                Ok(batches) => self.load_result(batches),
+                Err(err) => self.status = format!("Query error: {err}"),
+            }
+        }
+    }
+
+    fn load_result(&mut self, batches: Vec<RecordBatch>) {
+        match DataTable::from_batches(batches) {
+            Ok(data) => {
+                let ncols = data.num_cols();
+                self.apply_table(data);
+                self.status = format!("{} rows × {} cols", self.nrows, ncols);
+                self.mode = Mode::Table;
+                self.focus = Focus::Results;
+            }
+            Err(_) => {
+                self.data = None;
+                self.nrows = 0;
+                self.columns.clear();
+                self.col_widths.clear();
+                self.status = "0 rows".to_string();
+            }
+        }
+    }
+
+    /// Render a single frame, dispatching on whether the editor is present.
     fn render(&mut self, frame: &mut Frame) {
+        if self.editor.is_some() {
+            self.render_interactive(frame);
+        } else {
+            self.render_static(frame);
+        }
+    }
+
+    /// Static viewer: title bar / results / footer.
+    fn render_static(&mut self, frame: &mut Frame) {
         let [header, body, footer] = Layout::vertical([
-            Constraint::Length(1), // header (title)
-            Constraint::Min(0),    // body (results table or message)
-            Constraint::Length(1), // footer (key hints)
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
         ])
         .areas(frame.area());
 
@@ -161,42 +243,92 @@ impl App {
             header,
         );
 
-        if self.has_rows() {
-            self.render_table(frame, body);
-        } else {
-            let block = Block::bordered().title(" Results ");
-            frame.render_widget(Paragraph::new(self.status.clone()).block(block), body);
+        self.render_body(frame, body);
+        self.render_detail_overlay(frame);
+        frame.render_widget(Paragraph::new(self.footer_help()), footer);
+    }
+
+    /// Interactive mode: SQL editor / results / footer.
+    fn render_interactive(&mut self, frame: &mut Frame) {
+        let [top, body, footer] = Layout::vertical([
+            Constraint::Length(EDITOR_HEIGHT),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+
+        let focused = self.focus == Focus::Editor;
+        if let Some(editor) = &mut self.editor {
+            let border = if focused { Color::Blue } else { Color::DarkGray };
+            editor.set_block(
+                Block::bordered()
+                    .title(" SQL — F5 to run ")
+                    .border_style(Style::new().fg(border)),
+            );
+            frame.render_widget(&*editor, top);
         }
 
-        // The detail overlay (if open) sits on top of the table.
+        self.render_body(frame, body);
+        self.render_detail_overlay(frame);
+        frame.render_widget(Paragraph::new(self.footer_help()), footer);
+    }
+
+    /// Render the results table, or the status line when there is no data.
+    fn render_body(&mut self, frame: &mut Frame, area: Rect) {
+        if self.has_rows() {
+            self.render_table(frame, area);
+        } else {
+            let block = Block::bordered().title(" Results ");
+            frame.render_widget(Paragraph::new(self.status.clone()).block(block), area);
+        }
+    }
+
+    fn render_detail_overlay(&self, frame: &mut Frame) {
         if self.mode == Mode::Detail {
             let full = frame.area();
             self.render_detail(frame, full);
         }
+    }
 
-        let help = match self.mode {
-            Mode::Table => Line::from(vec![
-                key(" ↑/↓ j/k "),
-                Span::raw(" move  "),
-                key(" ←/→ h/l "),
-                Span::raw(" cols  "),
-                key(" g/G "),
-                Span::raw(" top/bottom  "),
-                key(" Enter "),
-                Span::raw(" details  "),
-                key(" q "),
-                Span::raw(" quit "),
-            ]),
-            Mode::Detail => Line::from(vec![
+    fn footer_help(&self) -> Line<'static> {
+        if self.mode == Mode::Detail {
+            return Line::from(vec![
                 key(" ↑/↓ j/k "),
                 Span::raw(" scroll  "),
                 key(" g/G "),
                 Span::raw(" top/bottom  "),
                 key(" Esc "),
                 Span::raw(" close "),
-            ]),
-        };
-        frame.render_widget(Paragraph::new(help), footer);
+            ]);
+        }
+        if self.editor.is_some() && self.focus == Focus::Editor {
+            return Line::from(vec![
+                key(" F5 "),
+                Span::raw(" run  "),
+                key(" Tab "),
+                Span::raw(" results  "),
+                key(" Ctrl-C "),
+                Span::raw(" quit "),
+            ]);
+        }
+
+        let mut spans = vec![
+            key(" ↑/↓ j/k "),
+            Span::raw(" move  "),
+            key(" ←/→ h/l "),
+            Span::raw(" cols  "),
+            key(" g/G "),
+            Span::raw(" top/bottom  "),
+            key(" Enter "),
+            Span::raw(" details  "),
+        ];
+        if self.editor.is_some() {
+            spans.push(key(" Tab "));
+            spans.push(Span::raw(" editor  "));
+        }
+        spans.push(key(" q "));
+        spans.push(Span::raw(" quit "));
+        Line::from(spans)
     }
 
     /// Render only the rows inside the current viewport. Cells are formatted from
@@ -367,9 +499,10 @@ impl App {
     }
 
     fn handle_events(&mut self) -> Result<()> {
-        if event::poll(Duration::from_millis(250))? {
+        // Poll briefly so a finished query is picked up promptly even while idle.
+        if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                     self.on_key(key);
                 }
             }
@@ -383,15 +516,54 @@ impl App {
             self.quit();
             return;
         }
-        match self.mode {
-            Mode::Table => self.on_key_table(key),
-            Mode::Detail => self.on_key_detail(key),
+        if self.mode == Mode::Detail {
+            self.on_key_detail(key);
+            return;
         }
+        if self.editor.is_some() && self.focus == Focus::Editor {
+            self.on_key_editor(key);
+        } else {
+            self.on_key_table(key);
+        }
+    }
+
+    fn on_key_editor(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::F(5) => self.run_query(),
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => self.run_query(),
+            KeyCode::Tab | KeyCode::Esc => self.focus = Focus::Results,
+            _ => {
+                if let Some(editor) = &mut self.editor {
+                    editor.input(key);
+                }
+            }
+        }
+    }
+
+    /// Submit the editor's SQL to the query engine.
+    fn run_query(&mut self) {
+        if self.engine.is_none() {
+            return;
+        }
+        let sql = match &self.editor {
+            Some(editor) => editor.lines().join("\n"),
+            None => return,
+        };
+        if sql.trim().is_empty() {
+            self.status = "Write a query first".to_string();
+            return;
+        }
+        if let Some(engine) = &self.engine {
+            engine.submit(sql);
+        }
+        self.status = "running…".to_string();
     }
 
     fn on_key_table(&mut self, key: KeyEvent) {
         let page = self.viewport_rows.max(1) as isize;
         match key.code {
+            KeyCode::Tab if self.editor.is_some() => self.focus = Focus::Editor,
+            KeyCode::Esc if self.editor.is_some() => self.focus = Focus::Editor,
             KeyCode::Char('q') | KeyCode::Esc => self.quit(),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
@@ -510,7 +682,7 @@ impl App {
 }
 
 /// A small inverted key-cap span for the footer hints.
-fn key(label: &str) -> Span<'_> {
+fn key(label: &str) -> Span<'static> {
     Span::styled(
         label.to_string(),
         Style::new().fg(Color::Black).bg(Color::Gray),
@@ -677,6 +849,24 @@ mod render_tests {
             (1u16..59).all(|x| buf[(x, 3)].style().bg != Some(Color::Blue)),
             "data rows should not share the header's fill"
         );
+    }
+
+    #[test]
+    fn interactive_layout_shows_editor_and_footer() {
+        // Build an interactive-looking app without a live engine.
+        let mut app = App {
+            editor: Some(TextArea::default()),
+            focus: Focus::Editor,
+            status: "Write a query and press F5".to_string(),
+            ..Default::default()
+        };
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let out = format!("{}", terminal.backend());
+
+        assert!(out.contains("SQL"), "editor pane should be labelled:\n{out}");
+        assert!(out.contains("F5"), "footer should show the run hint:\n{out}");
     }
 
     #[test]

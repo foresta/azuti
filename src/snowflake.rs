@@ -92,19 +92,6 @@ pub struct SnowflakeParams {
 /// the TUI starts — so connection or SQL errors surface on the terminal rather
 /// than inside the alternate screen.
 pub fn run_query(params: &SnowflakeParams, sql: &str) -> Result<Vec<RecordBatch>> {
-    // Key-pair auth puts the account into the JWT, where Snowflake rejects a
-    // region/cloud suffix. A dotted account is almost always a region locator,
-    // so point the user at the organization account identifier instead.
-    if params.account.contains('.') {
-        eprintln!(
-            "warning: account '{}' looks like a region locator; key-pair (JWT) auth needs the \
-             organization account identifier (e.g. ORG-ACCOUNT) — the region suffix makes the \
-             JWT invalid. Find it with: \
-             snow sql -q \"SELECT CURRENT_ORGANIZATION_NAME(), CURRENT_ACCOUNT_NAME()\"",
-            params.account
-        );
-    }
-
     let private_key_pem = std::fs::read_to_string(&params.private_key_path).wrap_err_with(|| {
         format!("reading private key {}", params.private_key_path.display())
     })?;
