@@ -18,8 +18,15 @@ clap = { version = "4", features = ["derive"] }
 color-eyre = "0.6"
 # Columnar in-memory data: holds result rows and formats cells for display.
 # `csv` enables the CSV reader; the Parquet reader lives in the `parquet` crate.
-arrow = { version = "60", features = ["csv"] }
-parquet = { version = "60", features = ["arrow"] }
+# Pinned to 57 to match the Arrow version used by `snowflake-api`, so Snowflake
+# result batches and our own RecordBatches are the same type.
+arrow = { version = "57", features = ["csv"] }
+parquet = { version = "57", features = ["arrow"] }
 # Measure the terminal display width of strings (full-width CJK counts as 2),
 # so column widths and truncation are correct for non-ASCII text.
 unicode-width = "0.2"
+# Snowflake connectivity (Arrow-native, pure Rust over HTTPS). Its Arrow version
+# is why `arrow`/`parquet` above are pinned to 57.
+snowflake-api = "0.14"
+# Async runtime used to run the Snowflake query once at startup.
+tokio = { version = "1", features = ["rt-multi-thread"] }

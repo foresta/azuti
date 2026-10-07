@@ -100,6 +100,11 @@ impl App {
         App::loaded(data, status)
     }
 
+    /// Build the app on top of an already-loaded table (e.g. a query result).
+    pub fn from_table(data: DataTable, status: String) -> Self {
+        App::loaded(data, status)
+    }
+
     fn empty(status: &str) -> Self {
         App {
             status: status.to_string(),
