@@ -50,6 +50,7 @@ On start you get a three-row layout (header / results table / key hints).
 | Key | Action |
 |---|---|
 | `↑` / `↓`, `j` / `k` | Move selection |
+| `←` / `→`, `h` / `l` | Scroll columns left / right |
 | `PageUp` / `PageDown` | Move by a page |
 | `g` / `G` | Jump to top / bottom |
 | `Enter` | Open the full-value detail view for the selected row (`Esc` to close) |
@@ -61,7 +62,8 @@ Supported input formats: **CSV** (header row inferred) and **Parquet**. Errors
 Cells wider than their column are clipped with a `…`, and column widths are
 measured in terminal cells so full-width (e.g. CJK) text aligns correctly. Press
 `Enter` to open a detail view with the selected row's full, untruncated values.
-Very wide tables do not scroll horizontally yet (tracked as a follow-up).
+Very wide tables scroll horizontally with `←` / `→` (or `h` / `l`); `‹` / `›` in
+the title mark columns hidden off the left / right edge.
 
 ## Stack
 

@@ -55,6 +55,8 @@ pub struct App {
     selected: usize,
     /// Absolute index of the first visible row.
     offset: usize,
+    /// Index of the first visible column (horizontal scroll).
+    col_offset: usize,
     /// Number of body rows that fit on screen (updated each render).
     viewport_rows: usize,
     /// One-line status shown in the table title (load result or error).
@@ -171,6 +173,8 @@ impl App {
             Mode::Table => Line::from(vec![
                 key(" ↑/↓ j/k "),
                 Span::raw(" move  "),
+                key(" ←/→ h/l "),
+                Span::raw(" cols  "),
                 key(" g/G "),
                 Span::raw(" top/bottom  "),
                 key(" Enter "),
@@ -229,12 +233,18 @@ impl App {
             }
         }
 
+        // Decide which columns fit, starting from the horizontal offset.
+        let inner_width = area.width.saturating_sub(2);
+        self.clamp_col_offset(inner_width);
+        let cols = self.visible_cols(inner_width);
+
         let rows: Vec<Row> = visible
             .iter()
             .map(|row| {
                 Row::new(
-                    row.iter()
-                        .zip(&self.col_widths)
+                    row[cols.clone()]
+                        .iter()
+                        .zip(&self.col_widths[cols.clone()])
                         .map(|(cell, w)| Cell::from(truncate_display(cell, *w)))
                         .collect::<Vec<_>>(),
                 )
@@ -242,17 +252,31 @@ impl App {
             .collect();
 
         let header_row = Row::new(
-            self.columns
+            self.columns[cols.clone()]
                 .iter()
-                .zip(&self.col_widths)
+                .zip(&self.col_widths[cols.clone()])
                 .map(|(c, w)| Cell::from(truncate_display(c, *w)))
                 .collect::<Vec<_>>(),
         )
         .style(Style::new().bold());
 
-        let constraints: Vec<Constraint> =
-            self.col_widths.iter().map(|w| Constraint::Length(*w)).collect();
-        let title = format!(" {}  —  row {}/{} ", self.status, self.selected + 1, self.nrows);
+        let constraints: Vec<Constraint> = self.col_widths[cols.clone()]
+            .iter()
+            .map(|w| Constraint::Length(*w))
+            .collect();
+
+        // `‹` / `›` show that more columns exist off the left / right edge.
+        let title = format!(
+            " {left}{status}  —  row {row}/{nrows}  col {c0}-{c1}/{ncols}{right} ",
+            left = if cols.start > 0 { "‹ " } else { "" },
+            right = if cols.end < self.columns.len() { " ›" } else { "" },
+            status = self.status,
+            row = self.selected + 1,
+            nrows = self.nrows,
+            c0 = cols.start + 1,
+            c1 = cols.end,
+            ncols = self.columns.len(),
+        );
         let table = Table::new(rows, constraints)
             .header(header_row)
             .row_highlight_style(Style::new().reversed())
@@ -276,6 +300,63 @@ impl App {
         }
         let max_offset = self.nrows.saturating_sub(visible);
         self.offset = self.offset.min(max_offset);
+    }
+
+    /// Reserved cells for the row-selection symbol (`"> "`) on the left.
+    const HIGHLIGHT_WIDTH: u16 = 2;
+
+    /// Clamp the horizontal offset so scrolling right stops once the last column
+    /// is fully visible and the width is filled.
+    fn clamp_col_offset(&mut self, inner_width: u16) {
+        let ncols = self.columns.len();
+        if ncols == 0 {
+            self.col_offset = 0;
+            return;
+        }
+        let avail = inner_width.saturating_sub(Self::HIGHLIGHT_WIDTH);
+        let mut used = 0u16;
+        let mut max_offset = ncols - 1;
+        for c in (0..ncols).rev() {
+            let add = self.col_widths[c] + if c == ncols - 1 { 0 } else { 1 };
+            if c != ncols - 1 && used + add > avail {
+                break;
+            }
+            used = used.saturating_add(add);
+            max_offset = c;
+        }
+        self.col_offset = self.col_offset.min(max_offset);
+    }
+
+    /// The range of columns that fit on screen from the current offset. At least
+    /// one column is always shown, even if it is wider than the screen.
+    fn visible_cols(&self, inner_width: u16) -> std::ops::Range<usize> {
+        let ncols = self.columns.len();
+        if ncols == 0 {
+            return 0..0;
+        }
+        let avail = inner_width.saturating_sub(Self::HIGHLIGHT_WIDTH);
+        let start = self.col_offset.min(ncols - 1);
+        let mut used = 0u16;
+        let mut end = start;
+        for c in start..ncols {
+            let add = self.col_widths[c] + if c == start { 0 } else { 1 };
+            if c != start && used + add > avail {
+                break;
+            }
+            used = used.saturating_add(add);
+            end = c + 1;
+        }
+        start..end
+    }
+
+    /// Move the horizontal column offset by `delta`, clamped to the columns.
+    fn move_col(&mut self, delta: isize) {
+        let ncols = self.columns.len();
+        if !self.has_rows() || ncols == 0 {
+            return;
+        }
+        let last = (ncols - 1) as isize;
+        self.col_offset = (self.col_offset as isize + delta).clamp(0, last) as usize;
     }
 
     fn handle_events(&mut self) -> Result<()> {
@@ -307,6 +388,8 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => self.quit(),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Left | KeyCode::Char('h') => self.move_col(-1),
+            KeyCode::Right | KeyCode::Char('l') => self.move_col(1),
             KeyCode::PageDown => self.move_selection(page),
             KeyCode::PageUp => self.move_selection(-page),
             KeyCode::Char('g') | KeyCode::Home => self.select(0),
@@ -566,6 +649,31 @@ mod render_tests {
         assert!(
             out.contains("item-999999"),
             "a wide value scrolled into view must not be clipped:\n{out}"
+        );
+    }
+
+    #[test]
+    fn horizontal_scroll_reveals_right_columns() {
+        // wide.csv has 40 columns; only the left ones fit at first.
+        let full = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/wide.csv");
+        let mut app = App::new(Some(full));
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+
+        terminal.draw(|f| app.render(f)).unwrap();
+        let left = format!("{}", terminal.backend());
+        assert!(left.contains("col01"), "left columns should be visible:\n{left}");
+        assert!(
+            !left.contains("col40"),
+            "the last column must be off-screen before scrolling:\n{left}"
+        );
+
+        app.move_col(100); // scroll fully right (render clamps to the end)
+        terminal.draw(|f| app.render(f)).unwrap();
+        let right = format!("{}", terminal.backend());
+        assert!(
+            right.contains("col40"),
+            "scrolling right should reveal the last column:\n{right}"
         );
     }
 }
