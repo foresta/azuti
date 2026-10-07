@@ -44,6 +44,16 @@ impl DataTable {
         Ok(Self { schema, batch })
     }
 
+    /// Build a table from Arrow record batches (e.g. a Snowflake query result).
+    pub fn from_batches(batches: Vec<RecordBatch>) -> Result<Self> {
+        let Some(first) = batches.first() else {
+            bail!("query returned no result batches");
+        };
+        let schema = first.schema();
+        let batch = concat_batches(&schema, &batches).wrap_err("concatenating result batches")?;
+        Ok(Self { schema, batch })
+    }
+
     pub fn column_names(&self) -> Vec<String> {
         self.schema
             .fields()
@@ -194,6 +204,24 @@ mod tests {
         let row0 = table.format_row(0).unwrap();
         assert_eq!(row0.len(), 5);
         assert_eq!(row0[1], "Ada Lovelace");
+    }
+
+    #[test]
+    fn from_batches_concatenates() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let b1 =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap();
+        let b2 =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![3]))]).unwrap();
+
+        let table = DataTable::from_batches(vec![b1, b2]).unwrap();
+        assert_eq!(table.num_rows(), 3);
+        assert_eq!(table.column_names(), ["n"]);
+        assert_eq!(table.format_row(2).unwrap()[0], "3");
     }
 
     #[test]

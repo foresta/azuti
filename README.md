@@ -22,7 +22,7 @@ romanization.
 | a | CLI scaffold + TUI skeleton | ✅ |
 | b | Show local data (CSV / Parquet) | ✅ |
 | c | Fast table over synthetic data (Arrow + viewport rendering) | ✅ |
-| d | Connect to Snowflake (key-pair / JWT first, SSO later) | — |
+| d | Connect to Snowflake (key-pair / JWT first, SSO later) | ✅ |
 
 ## Usage (work in progress)
 
@@ -64,6 +64,51 @@ measured in terminal cells so full-width (e.g. CJK) text aligns correctly. Press
 `Enter` to open a detail view with the selected row's full, untruncated values.
 Very wide tables scroll horizontally with `←` / `→` (or `h` / `l`); `‹` / `›` in
 the title mark columns hidden off the left / right edge.
+
+## Snowflake
+
+Run a query against Snowflake with key-pair (JWT) auth and browse the result.
+
+Using `~/.snowflake/connections.toml` (the same file the `snow` CLI uses):
+
+```sh
+# Uses the [default] connection
+cargo run -- --sql "SELECT * FROM my_db.my_schema.my_table LIMIT 10000"
+
+# Or a named connection
+cargo run -- --sql "SELECT ..." --connection my_conn
+```
+
+Any explicit flag overrides the value from connections.toml. To skip the file
+entirely and pass everything on the command line:
+
+```sh
+cargo run -- \
+  --sql "SELECT * FROM my_db.my_schema.my_table LIMIT 10000" \
+  --account ab12345.ap-northeast-1.aws \
+  --user ME \
+  --private-key ~/.snowflake/rsa_key.p8 \
+  --warehouse WH --database MY_DB --schema MY_SCHEMA --role MY_READONLY_ROLE
+```
+
+The connections file is found via `$SNOWFLAKE_HOME` or `~/.snowflake`, or set it
+with `--connections-file`.
+
+The query runs once at startup; connection or SQL errors are printed to the
+terminal (not inside the TUI). Results come back as Arrow and flow into the same
+viewport-rendered table as local files.
+
+Notes:
+
+- Prefer a **read-only role** for viewing — Snowflake has no app-enforced
+  read-only mode, so access is controlled by the role you connect with.
+- For key-pair auth, set `account` to the **organization account identifier**
+  (e.g. `MYORG-MYACCOUNT`), not the region locator
+  (`xy12345.ap-northeast-1.aws`): the region suffix makes the JWT invalid. Find
+  yours with `snow sql -q "SELECT CURRENT_ORGANIZATION_NAME(), CURRENT_ACCOUNT_NAME()"`.
+- The private key must be an **unencrypted PEM** (PKCS#8) for now.
+- Connectivity uses [`snowflake-api`](https://crates.io/crates/snowflake-api),
+  which talks to Snowflake's HTTPS API; `arrow` is pinned to the version it uses.
 
 ## Stack
 
