@@ -35,3 +35,5 @@ toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 # Format Snowflake's struct-encoded temporal values into readable datetimes.
 chrono = "0.4"
+# Multi-line SQL editor widget for the interactive TUI.
+tui-textarea-2 = { version = "0.13", default-features = false, features = ["crossterm", "ratatui"] }

@@ -67,9 +67,25 @@ the title mark columns hidden off the left / right edge.
 
 ## Snowflake
 
-Run a query against Snowflake with key-pair (JWT) auth and browse the result.
+Connect with key-pair (JWT) auth, using `~/.snowflake/connections.toml` (the same
+file the `snow` CLI uses).
 
-Using `~/.snowflake/connections.toml` (the same file the `snow` CLI uses):
+**Interactive** — open a SQL editor connected to Snowflake (no `--sql`):
+
+```sh
+cargo run -- --connection default
+```
+
+Type SQL and press **Ctrl+Enter** (or **Ctrl+R**) to run; results fill the table
+below. `Tab` switches focus between the editor and the results; in the results
+the usual keys work (`j`/`k`, `←`/`→`, `Enter` for the detail view). `Ctrl-C`
+quits.
+
+> `Ctrl+Enter` only reaches the app on terminals that support the keyboard
+> enhancement protocol (e.g. Kitty, WezTerm, Ghostty, recent iTerm2). Everywhere
+> else it reads as a newline — use `Ctrl+R`, which always works.
+
+**One-shot** — run a single query and show the result:
 
 ```sh
 # Uses the [default] connection
