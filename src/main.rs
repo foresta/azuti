@@ -1,5 +1,8 @@
 mod app;
+mod catalog;
+mod complete;
 mod data;
+mod meta;
 mod query;
 mod snowflake;
 
@@ -7,6 +10,7 @@ use app::App;
 use clap::Parser;
 use color_eyre::eyre::{bail, Result};
 
+use crate::catalog::worker::MetaWorker;
 use crate::data::DataTable;
 use crate::query::QueryEngine;
 use crate::snowflake::{ConnConfig, SnowflakeParams};
@@ -161,7 +165,8 @@ fn build_app(cli: Cli) -> Result<App> {
         // Interactive: open the SQL editor connected to Snowflake.
         let params = cli.snowflake_params()?;
         warn_if_region_locator(&params);
-        Ok(App::interactive(QueryEngine::spawn(params)))
+        let meta = MetaWorker::spawn(params.clone());
+        Ok(App::interactive(QueryEngine::spawn(params), meta))
     } else if let Some(rows) = cli.demo {
         Ok(App::from_demo(rows))
     } else {
