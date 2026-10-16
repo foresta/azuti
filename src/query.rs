@@ -3,7 +3,7 @@ use std::thread::{self, JoinHandle};
 
 use arrow::array::RecordBatch;
 
-use crate::snowflake::{self, SnowflakeParams};
+use crate::snowflake::{Session, SnowflakeParams};
 
 /// The result of a submitted query: Arrow batches, or an error message.
 pub type QueryOutcome = Result<Vec<RecordBatch>, String>;
@@ -18,8 +18,8 @@ pub struct QueryEngine {
 }
 
 impl QueryEngine {
-    /// Spawn the worker. Each submitted query connects, runs, and returns Arrow
-    /// batches (connection reuse is a later optimization).
+    /// Spawn the worker. It keeps one session for its lifetime and reconnects on
+    /// the next query if building the session failed.
     pub fn spawn(params: SnowflakeParams) -> Self {
         let (sql_tx, sql_rx) = mpsc::channel::<String>();
         let (result_tx, result_rx) = mpsc::channel::<QueryOutcome>();
@@ -43,10 +43,23 @@ impl QueryEngine {
 }
 
 fn worker(params: SnowflakeParams, sql_rx: Receiver<String>, result_tx: Sender<QueryOutcome>) {
+    let mut session: Option<Session> = None;
     while let Ok(sql) = sql_rx.recv() {
-        let outcome = snowflake::run_query(&params, &sql).map_err(|e| format!("{e:#}"));
+        let outcome = run(&params, &mut session, &sql).map_err(|e| format!("{e:#}"));
         if result_tx.send(outcome).is_err() {
             break; // the UI is gone
         }
     }
+}
+
+fn run(
+    params: &SnowflakeParams,
+    session: &mut Option<Session>,
+    sql: &str,
+) -> color_eyre::Result<Vec<RecordBatch>> {
+    let session = match session {
+        Some(s) => s,
+        None => session.insert(Session::connect(params)?),
+    };
+    session.exec(sql)?.into_batches()
 }
