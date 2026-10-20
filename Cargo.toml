@@ -39,3 +39,6 @@ chrono = "0.4"
 tui-textarea-2 = { version = "0.13", default-features = false, features = ["crossterm", "ratatui"] }
 serde_json = "1"
 frizbee = "0.13.0"
+# Local SQL over opened files and displayed results. 52.x is the last line on
+# arrow 57 (53+ moves to arrow 58), so it stays here until arrow is bumped.
+datafusion = { version = "52", default-features = false, features = ["sql", "recursive_protection", "nested_expressions", "datetime_expressions", "string_expressions", "unicode_expressions", "regex_expressions"] }

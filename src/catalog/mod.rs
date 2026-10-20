@@ -100,16 +100,50 @@ const RESERVED: &[&str] = &[
     "WITH",
 ];
 
+/// Which case an unquoted identifier folds to: Snowflake upper-cases it,
+/// DataFusion lower-cases it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Folding {
+    Upper,
+    Lower,
+}
+
+impl Folding {
+    fn fold(self, s: &str) -> String {
+        match self {
+            Folding::Upper => s.to_uppercase(),
+            Folding::Lower => s.to_lowercase(),
+        }
+    }
+
+    /// DataFusion's parser accepts nearly every keyword as a table name; only
+    /// TABLE and LATERAL start a different table factor there, so quoting the
+    /// rest would only clutter local SQL.
+    fn reserved(self) -> &'static [&'static str] {
+        match self {
+            Folding::Upper => RESERVED,
+            Folding::Lower => &["TABLE", "LATERAL"],
+        }
+    }
+
+    fn is_folded(self, c: char) -> bool {
+        match self {
+            Folding::Upper => c.is_ascii_uppercase(),
+            Folding::Lower => c.is_ascii_lowercase(),
+        }
+    }
+}
+
 impl Name {
     pub fn new(s: impl Into<String>) -> Self {
         Name(s.into())
     }
 
-    pub fn from_ident(part: &IdentPart) -> Self {
+    pub fn from_ident_with(part: &IdentPart, folding: Folding) -> Self {
         if part.quoted {
             Name(part.text.clone())
         } else {
-            Name(part.text.to_uppercase())
+            Name(folding.fold(&part.text))
         }
     }
 
@@ -118,14 +152,18 @@ impl Name {
     }
 
     pub fn to_sql(&self) -> String {
+        self.to_sql_with(Folding::Upper)
+    }
+
+    pub fn to_sql_with(&self, folding: Folding) -> String {
         let s = &self.0;
         let bare = s
             .chars()
             .next()
-            .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+            .is_some_and(|c| folding.is_folded(c) || c == '_')
             && s.chars()
-                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_' || c == '$')
-            && !RESERVED.contains(&s.as_str());
+                .all(|c| folding.is_folded(c) || c.is_ascii_digit() || c == '_' || c == '$')
+            && !folding.reserved().contains(&s.to_uppercase().as_str());
         if bare {
             s.clone()
         } else {
@@ -320,6 +358,7 @@ struct Entry {
 pub struct Catalog {
     #[allow(dead_code)] // TODO: read when CacheStore persists per (account, role)
     key: CatalogKey,
+    folding: Folding,
     entries: HashMap<Scope, Entry>,
     /// Tickets are unique across the whole catalog, not per entry: an entry
     /// dropped and recreated must never accept a patch issued before the drop.
@@ -327,12 +366,22 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    #[cfg(test)]
     pub fn new(key: CatalogKey) -> Self {
+        Self::with_folding(key, Folding::Upper)
+    }
+
+    pub fn with_folding(key: CatalogKey, folding: Folding) -> Self {
         Self {
             key,
+            folding,
             entries: HashMap::new(),
             next_ticket: 0,
         }
+    }
+
+    pub fn folding(&self) -> Folding {
+        self.folding
     }
 
     pub fn view(&self, scope: &Scope, now: SystemTime) -> ScopeView<'_> {
@@ -417,7 +466,6 @@ impl Catalog {
         ApplyOutcome::Applied
     }
 
-    #[allow(dead_code)] // TODO: called from statement_effects (DDL / USE detection)
     pub fn invalidate(&mut self, scope: &Scope, recursive: bool) {
         for (s, e) in self.entries.iter_mut() {
             if s == scope || (recursive && s.is_within(scope)) {
@@ -468,6 +516,13 @@ mod tests {
         assert_eq!(Name::new("orders").to_sql(), "\"orders\"");
         assert_eq!(Name::new("ORDER").to_sql(), "\"ORDER\"");
         assert_eq!(Name::new("A\"B").to_sql(), "\"A\"\"B\"");
+        assert_eq!(Name::new("orders").to_sql_with(Folding::Lower), "orders");
+        assert_eq!(Name::new("ORDERS").to_sql_with(Folding::Lower), "\"ORDERS\"");
+        assert_eq!(Name::new("sample").to_sql_with(Folding::Lower), "sample");
+        assert_eq!(Name::new("table").to_sql_with(Folding::Lower), "\"table\"");
+        assert_eq!(Name::new("lateral").to_sql_with(Folding::Lower), "\"lateral\"");
+        let typed = IdentPart { text: "Sales".into(), quoted: false };
+        assert_eq!(Name::from_ident_with(&typed, Folding::Lower), Name::new("sales"));
         assert_eq!(Name::new("it's").to_sql_string(), "'it\\'s'");
     }
 

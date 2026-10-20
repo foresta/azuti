@@ -4,7 +4,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
 use super::source::{MetadataSource, ShowSource};
-use super::{CatalogKey, CatalogPatch, CurrentScope, FetchRequest, Priority, Scope};
+use super::{CatalogKey, CatalogPatch, CurrentScope, FetchRequest, Folding, Priority, Scope};
 use crate::snowflake::{Session, SnowflakeParams};
 
 #[derive(Debug)]
@@ -12,6 +12,7 @@ pub enum WorkerEvent {
     Connected {
         key: CatalogKey,
         current: CurrentScope,
+        folding: Folding,
     },
     ConnectFailed(String),
     Patch(CatalogPatch),
@@ -38,7 +39,6 @@ impl MetaWorker {
         })
     }
 
-    #[cfg(test)]
     pub fn spawn_with(source: Box<dyn MetadataSource + Send>) -> Self {
         Self::start(move |_| Some(source))
     }
@@ -121,7 +121,11 @@ fn run(
     event_tx: Sender<WorkerEvent>,
 ) {
     let connected = match source.identify() {
-        Ok((key, current)) => WorkerEvent::Connected { key, current },
+        Ok((key, current)) => WorkerEvent::Connected {
+            key,
+            current,
+            folding: source.folding(),
+        },
         Err(e) => WorkerEvent::ConnectFailed(format!("{e:#}")),
     };
     let failed = matches!(connected, WorkerEvent::ConnectFailed(_));
