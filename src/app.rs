@@ -29,6 +29,11 @@ const MAX_COL_WIDTH: u16 = 40;
 const DETAIL_PAGE_STEP: usize = 20;
 /// Height (rows) of the SQL editor pane in interactive mode.
 const EDITOR_HEIGHT: u16 = 8;
+/// Filled bars (title bar, table header). White on blue was hard to read: most
+/// themes render ANSI blue dark and ANSI white as light gray. Cyan is light in
+/// nearly every theme, so black text on it keeps a high contrast.
+const BAR_FG: Color = Color::Black;
+const BAR_BG: Color = Color::Cyan;
 
 /// Which view currently has focus.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -238,8 +243,8 @@ impl App {
         frame.render_widget(
             Paragraph::new(" azuti ")
                 .bold()
-                .bg(Color::Blue)
-                .fg(Color::White),
+                .bg(BAR_BG)
+                .fg(BAR_FG),
             header,
         );
 
@@ -399,7 +404,7 @@ impl App {
         )
         // Give the header a filled bar so it reads clearly apart from the data
         // rows (and from the reversed selection highlight).
-        .style(Style::new().bold().fg(Color::White).bg(Color::Blue));
+        .style(Style::new().bold().fg(BAR_FG).bg(BAR_BG));
 
         let constraints: Vec<Constraint> = self.col_widths[cols.clone()]
             .iter()
@@ -847,11 +852,11 @@ mod render_tests {
         let buf = terminal.backend().buffer();
         // y0 is the title bar, y1 the top border, y2 the header row, y3 data.
         assert!(
-            (1u16..59).all(|x| buf[(x, 2)].style().bg == Some(Color::Blue)),
+            (1u16..59).all(|x| buf[(x, 2)].style().bg == Some(BAR_BG)),
             "header row should be a filled bar"
         );
         assert!(
-            (1u16..59).all(|x| buf[(x, 3)].style().bg != Some(Color::Blue)),
+            (1u16..59).all(|x| buf[(x, 3)].style().bg != Some(BAR_BG)),
             "data rows should not share the header's fill"
         );
     }
