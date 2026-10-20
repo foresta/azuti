@@ -644,3 +644,130 @@ struct App {
 | Folding | 小文字の名前が Lower ではクォートされず、Upper ではクォートされる |
 | App | ドリルダウンでエディタが開き、初期文と実行先が入る（`TestBackend`） |
 
+## 接続とデータソース
+
+`docs/architecture.md` の「接続とデータソース」の型と API。挙動は変えないリファクタとして入れる（接続ピッカーは別の回）。
+
+### モジュール
+
+```
+src/
+  connection.rs       QueryOutcome、Engine、ConnectionId、ConnectionSpec、SourceKind、Connection、Connections
+  query.rs            SnowflakeEngine（旧 QueryEngine）
+  local.rs            ResultStore と LocalEngine に分ける
+  app.rs              engine / meta / local / local_meta / target / other_sql を Connections と ResultStore に置き換える
+```
+
+### 型
+
+```rust
+pub type QueryOutcome = Result<Vec<RecordBatch>, String>;
+
+pub trait Engine: Debug {
+    fn submit(&self, sql: String);
+    /// ノンブロッキング。終わった結果を 1 つ返す（App は None になるまで取り出す）。
+    fn poll(&self) -> Option<QueryOutcome>;
+}
+
+/// 添字。`ConnectionId::LOCAL`（0）は常にローカル。
+pub struct ConnectionId(usize);
+
+pub struct ConnectionSpec {
+    pub name: String,        // エディタの枠のタイトルに出す。今は "local" / "Snowflake"
+    pub kind: SourceKind,
+}
+
+pub enum SourceKind {
+    Local,
+    Snowflake(SnowflakeParams),
+    #[cfg(test)] Fake,       // テストで「リモート役」の接続を差し込む
+}
+
+pub struct Connection {
+    pub engine: Box<dyn Engine>,
+    pub meta: Option<MetaSystem>,   // 補完のカタログが作れなかったときは None（クエリは動く）
+}
+
+/// Default はローカルだけの一覧で、今の接続はローカル。
+pub struct Connections {
+    specs: Vec<ConnectionSpec>,
+    open: BTreeMap<ConnectionId, Connection>,         // ID 順。同じ tick に届いた結果の result_N を安定させる
+    parked_sql: HashMap<ConnectionId, Vec<String>>,   // 表示していない接続のエディタの文。開いた接続とは別に持つ
+    current, previous,
+}
+
+impl Connections {
+    pub fn add(&mut self, spec: ConnectionSpec) -> ConnectionId;
+    pub fn len(&self) -> usize;                       // 設定の数（開いた数ではない）
+    pub fn current_id(&self) -> ConnectionId;
+    pub fn current_spec(&self) -> &ConnectionSpec;
+    pub fn previous(&self) -> Option<ConnectionId>;
+    /// 開いていなければ開く。
+    pub fn current(&mut self, store: &ResultStore) -> &mut Connection;
+    pub fn get_open_mut(&mut self, id: ConnectionId) -> Option<&mut Connection>;
+    pub fn open_mut(&mut self) -> impl Iterator<Item = (ConnectionId, &mut Connection)>;
+    /// 今の接続を id にし、離れる接続に shown（エディタの文）を預け、id に預けてあった文を返す。
+    /// 接続を開かない。id が今の接続なら何もせず shown をそのまま返す（previous も変えない）。
+    pub fn switch(&mut self, id: ConnectionId, shown: Vec<String>) -> Vec<String>;
+}
+```
+
+- 接続を開く処理は `SourceKind` ごとに 1 か所（`ConnectionSpec::open`）
+  - Local: `LocalEngine::spawn(store.context())`、`LocalSource::new(store.context())` の MetaSystem
+  - Snowflake: `SnowflakeEngine::spawn(params)`、`MetaWorker::spawn(params)` の MetaSystem
+- 今の種別は開くのに失敗しない（Snowflake は最初のクエリで接続する）。開くのに失敗しうる種別（DuckDB / SQLite のファイル）を足すときに、
+  `open` を `Result` にし、開く場所を App の切り替えに寄せる
+- 設定の出所（`connections.toml` / 引数）と、切断・状態の API は接続ピッカーの回で足す。状態はひとまず `Connection::meta` の `MetaStatus` で代用できる
+
+### ResultStore と LocalEngine
+
+```rust
+/// Default で、Snowflake 方言のパーサを設定した SessionContext を作る。
+pub struct ResultStore { ctx: SessionContext }
+
+impl ResultStore {
+    pub fn context(&self) -> SessionContext;
+    /// 同期で登録する。`last` にはしない。
+    pub fn register_file(&self, name: &str, batch: RecordBatch) -> Result<()>;
+    /// `name` と `last` に登録する。既にあれば置き換える。
+    pub fn register_result(&self, name: &str, batch: RecordBatch) -> Result<()>;
+}
+
+/// ResultStore と同じ SessionContext に問い合わせる。専用スレッドで実行する。
+pub struct LocalEngine { … }
+impl LocalEngine { pub fn spawn(ctx: SessionContext) -> Self; }
+impl Engine for LocalEngine { … }
+```
+
+- `LocalEvent`（Registered / RegisterFailed）はなくなる。App は登録の戻り値で、成功ならローカル接続のカタログを無効化し、失敗なら `view_name` を消してステータスに出す
+- 列名の小文字化・重複の番号付け、読み取り専用の SQL は今のまま
+
+### App
+
+| 今 | 置き換え後 |
+|---|---|
+| `engine` / `meta` / `local` / `local_meta` | `connections: Connections`、`store: ResultStore` |
+| `target: Target` | `connections.current_id()` |
+| `other_sql` | `Connections` が接続ごとに預かる文（`switch` の引数と戻り値） |
+| `toggle_target`（Ctrl+T） | 直前の接続に切り替える。直前が無ければ「No other connection to switch to」をステータスに出す |
+| `drill_down`（d） | ローカル接続に切り替えてから、エディタに `SELECT * FROM <view_name>` を入れる |
+
+- `switch_to(id)`: 今のエディタの文を `switch` に渡し、戻ってきた文をエディタに入れる（カーソルは末尾）。ポップアップは閉じる。切り替え先は使うとき（補完・実行）に開く
+- 登録（ファイル・結果）の後: 成功なら `view_name` を設定し、ローカル接続が開いていればそのカタログを無効化する（開いていなければ、開くときに最新を取る）。
+  失敗なら `view_name` を消し、ステータスを `{name} cannot be queried: …` で上書きする
+- 対話モードの起動は、ローカルだけの一覧に Snowflake を `add` して `switch` する。previous がローカルになるので、起動直後の Ctrl+T でローカルに行ける
+- `poll_query`: 開いている全接続の Engine を poll する。どの接続の結果も表示し、ResultStore に登録する
+- `poll_meta`: 開いている全接続の MetaSystem を poll する。今の接続のカタログが変わったときだけポップアップを再計算する
+- エディタの枠のタイトルは `connections.current_spec()` から作る（ローカルは ` SQL · local `、Snowflake は ` SQL · Snowflake `。文言は今と同じ）
+- フッタの `Ctrl+T` の案内は、接続が 2 つ以上あるときだけ出す
+- 起動: ファイル / デモ / `--sql` はローカルだけの一覧、`--connection` などの対話モードはローカル＋Snowflake で、Snowflake を今の接続にする。
+  どのモードでも起動時の接続は先に開く（`d` の直後の最初の入力から補完が出るように）
+
+### テスト
+
+| 対象 | 方法 |
+|---|---|
+| Connections | 切り替えと previous、遅延で開く |
+| App | target / other_sql を直接触っていた 2 件は current_id と接続ごとの文で書き直す。`SourceKind::Fake` で「リモート役」の接続を差し込み、`d` → Ctrl+T → Ctrl+T でエディタの文が往復することを確かめる（今まで Snowflake の Engine を作れず試せなかった） |
+| ResultStore | 今の LocalEngine のテスト（登録・`last`・列名・読み取り専用）を同期 API に移す |
+

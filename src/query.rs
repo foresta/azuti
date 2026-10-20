@@ -3,21 +3,19 @@ use std::thread::{self, JoinHandle};
 
 use arrow::array::RecordBatch;
 
+use crate::connection::{Engine, QueryOutcome};
 use crate::snowflake::{Session, SnowflakeParams};
-
-/// The result of a submitted query: Arrow batches, or an error message.
-pub type QueryOutcome = Result<Vec<RecordBatch>, String>;
 
 /// A background worker that runs Snowflake queries off the UI thread, so the TUI
 /// stays responsive while a query is in flight.
 #[derive(Debug)]
-pub struct QueryEngine {
+pub struct SnowflakeEngine {
     sql_tx: Sender<String>,
     result_rx: Receiver<QueryOutcome>,
     _handle: JoinHandle<()>,
 }
 
-impl QueryEngine {
+impl SnowflakeEngine {
     /// Spawn the worker. It keeps one session for its lifetime and reconnects on
     /// the next query if building the session failed.
     pub fn spawn(params: SnowflakeParams) -> Self {
@@ -30,14 +28,14 @@ impl QueryEngine {
             _handle: handle,
         }
     }
+}
 
-    /// Queue a query to run. The result arrives later via [`QueryEngine::poll`].
-    pub fn submit(&self, sql: String) {
+impl Engine for SnowflakeEngine {
+    fn submit(&self, sql: String) {
         let _ = self.sql_tx.send(sql);
     }
 
-    /// Non-blocking check for a finished query.
-    pub fn poll(&self) -> Option<QueryOutcome> {
+    fn poll(&self) -> Option<QueryOutcome> {
         self.result_rx.try_recv().ok()
     }
 }

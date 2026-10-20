@@ -18,15 +18,14 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use arrow::array::RecordBatch;
 use tui_textarea::{CursorMove, TextArea};
 
-use crate::catalog::source::LocalSource;
-use crate::catalog::worker::MetaWorker;
 use crate::catalog::{CurrentScope, Folding, Name, Scope};
 use crate::complete::context::{analyze, CompletionContext, Expect};
 use crate::complete::rank::{CandidateKind, Completion};
+use crate::connection::{ConnectionId, ConnectionSpec, Connections};
 use crate::data::DataTable;
-use crate::local::{table_name_for, LocalEngine, LocalEvent};
-use crate::meta::{MetaStatus, MetaSystem};
-use crate::query::QueryEngine;
+use crate::local::{table_name_for, ResultStore};
+use crate::meta::MetaStatus;
+use crate::snowflake::SnowflakeParams;
 
 /// Rows beyond this are not scanned when measuring column widths (keeps load
 /// cheap on large tables).
@@ -99,34 +98,19 @@ pub struct App {
     detail_scroll: u16,
     /// SQL editor, present only in interactive mode.
     editor: Option<TextArea<'static>>,
-    /// Background query worker, present only in interactive mode.
-    engine: Option<QueryEngine>,
     /// Which pane has focus (interactive mode).
     focus: Focus,
-    /// Where the editor's SQL runs.
-    target: Target,
-    /// DataFusion over opened files and displayed results.
-    local: Option<LocalEngine>,
-    /// Completion catalog for local SQL.
-    local_meta: Option<MetaSystem>,
+    /// Where the editor's SQL runs, and every connection opened so far.
+    connections: Connections,
+    /// Opened files and displayed results, for local SQL.
+    store: ResultStore,
     /// What local SQL calls the data on screen (a file's table name or
     /// `result_N`); drilling down starts from it.
     view_name: Option<String>,
     /// Results named so far; the next one is `result_{n + 1}`.
     results: usize,
-    /// The editor text of the target not shown, swapped back in by Ctrl+T.
-    other_sql: Vec<String>,
-    /// Metadata catalog for completion, present only in interactive mode.
-    meta: Option<MetaSystem>,
     /// The open completion list, if any.
     popup: Option<CompletionPopup>,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum Target {
-    #[default]
-    Local,
-    Snowflake,
 }
 
 #[derive(Debug)]
@@ -153,12 +137,11 @@ impl App {
                         data.num_rows(),
                         data.num_cols()
                     );
+                    let batch = data.batch().clone();
                     let mut app = App::loaded(data, status);
-                    if let Some(data) = &app.data {
-                        let batch = data.batch().clone();
-                        app.local_engine().register_file(&name, batch);
-                    }
-                    app.view_name = Some(name);
+                    let registered = app.store.register_file(&name, batch);
+                    app.registered(name, registered);
+                    app.open_current();
                     app
                 }
                 // `{:#}` prints the whole eyre error chain on one line.
@@ -172,6 +155,7 @@ impl App {
         let data = DataTable::demo(nrows);
         let mut app = App::default();
         app.show_result(data);
+        app.open_current();
         app
     }
 
@@ -179,6 +163,7 @@ impl App {
     pub fn from_table(data: DataTable) -> Self {
         let mut app = App::default();
         app.show_result(data);
+        app.open_current();
         app
     }
 
@@ -199,18 +184,29 @@ impl App {
     }
 
     /// Build the app in interactive mode: a SQL editor backed by a query engine.
-    pub fn interactive(engine: QueryEngine, meta: MetaWorker) -> Self {
+    pub fn interactive(params: SnowflakeParams) -> Self {
+        App::with_remote(ConnectionSpec::snowflake(params))
+    }
+
+    fn with_remote(spec: ConnectionSpec) -> Self {
         let mut editor = TextArea::default();
         editor.set_placeholder_text("SELECT …   (Ctrl+Enter or Ctrl+R to run)");
-        App {
+        let mut app = App {
             editor: Some(editor),
-            engine: Some(engine),
-            meta: Some(MetaSystem::new(meta)),
-            target: Target::Snowflake,
             focus: Focus::Editor,
             status: "Write a query and press Ctrl+Enter (or Ctrl+R)".to_string(),
             ..Default::default()
-        }
+        };
+        let remote = app.connections.add(spec);
+        app.connections.switch(remote, Vec::new());
+        app.open_current();
+        app
+    }
+
+    /// Opens the starting connection up front so its catalog is already
+    /// fetching (or logging in) while the user reads or types.
+    fn open_current(&mut self) {
+        self.connections.current(&self.store);
     }
 
     /// Replace the current table with `data`, resetting scroll and selection.
@@ -231,22 +227,34 @@ impl App {
         self.results += 1;
         let name = format!("result_{}", self.results);
         self.status = format!("{name}  —  {} rows × {} cols", data.num_rows(), data.num_cols());
-        self.local_engine()
-            .register_result(&name, data.batch().clone());
-        self.view_name = Some(name);
+        let registered = self.store.register_result(&name, data.batch().clone());
         self.apply_table(data);
+        self.registered(name, registered);
     }
 
-    fn local_engine(&mut self) -> &LocalEngine {
-        if self.local.is_none() {
-            let engine = LocalEngine::spawn();
-            // Without a catalog, local SQL still runs; only completion is lost.
-            self.local_meta = LocalSource::new(engine.context())
-                .ok()
-                .map(|source| MetaSystem::new(MetaWorker::spawn_with(Box::new(source))));
-            self.local = Some(engine);
+    /// A table that failed to register cannot be drilled into. One that did is
+    /// refetched into local completion if the local connection is open;
+    /// otherwise opening it reads the latest.
+    fn registered(&mut self, name: String, result: Result<()>) {
+        if let Err(e) = result {
+            self.status = format!("{name} cannot be queried: {e:#}");
+            self.view_name = None;
+            return;
         }
-        self.local.as_ref().expect("just created")
+        self.view_name = Some(name);
+        if let Some(meta) = self
+            .connections
+            .get_open_mut(ConnectionId::LOCAL)
+            .and_then(|c| c.meta.as_mut())
+        {
+            if let CurrentScope {
+                database: Some(db),
+                schema: Some(schema),
+            } = meta.current().clone()
+            {
+                meta.invalidate(&Scope::Schema(db, schema));
+            }
+        }
     }
 
     fn has_rows(&self) -> bool {
@@ -260,18 +268,19 @@ impl App {
             terminal.draw(|frame| self.render(frame))?;
             self.handle_events()?;
             self.poll_query();
-            self.poll_local();
             self.poll_meta();
         }
         Ok(())
     }
 
-    /// Check the query engine for a finished result and apply it.
+    /// Every open connection is polled, not just the current one: a query
+    /// started before switching still lands in the grid.
     fn poll_query(&mut self) {
-        let Some(engine) = &self.engine else {
-            return;
-        };
-        if let Some(outcome) = engine.poll() {
+        let mut outcomes = Vec::new();
+        for (_, conn) in self.connections.open_mut() {
+            outcomes.extend(std::iter::from_fn(|| conn.engine.poll()));
+        }
+        for outcome in outcomes {
             match outcome {
                 Ok(batches) => self.load_result(batches),
                 Err(err) => self.status = format!("Query error: {err}"),
@@ -279,57 +288,27 @@ impl App {
         }
     }
 
-    fn poll_local(&mut self) {
-        let Some(local) = &self.local else {
-            return;
-        };
-        for event in local.poll() {
-            match event {
-                LocalEvent::Registered => {
-                    if let Some(meta) = &mut self.local_meta {
-                        if let CurrentScope {
-                            database: Some(db),
-                            schema: Some(schema),
-                        } = meta.current().clone()
-                        {
-                            meta.invalidate(&Scope::Schema(db, schema));
-                        }
-                    }
-                    if self.popup.is_some() && self.target == Target::Local {
-                        self.refresh_popup(false);
-                    }
-                }
-                LocalEvent::RegisterFailed { name, error } => {
-                    if self.view_name.as_ref() == Some(&name) {
-                        self.view_name = None;
-                    }
-                    self.status = format!("{name} cannot be queried: {error}");
-                }
-                LocalEvent::Result(Ok(batches)) => self.load_result(batches),
-                LocalEvent::Result(Err(err)) => self.status = format!("Query error: {err}"),
-            }
-        }
-    }
-
     fn poll_meta(&mut self) {
-        let mut changed = false;
-        if let Some(meta) = &mut self.local_meta {
-            changed |= meta.poll() && self.target == Target::Local;
-        }
-        if changed && self.popup.is_some() {
-            self.refresh_popup(false);
-        }
-        let Some(meta) = &mut self.meta else {
-            return;
-        };
-        let was_failed = matches!(meta.status, MetaStatus::Failed(_));
-        let changed = meta.poll();
-        if let MetaStatus::Failed(err) = &meta.status {
-            if !was_failed {
-                self.status = format!("Completion unavailable: {err}");
+        let current = self.connections.current_id();
+        let mut refresh = false;
+        let mut failure = None;
+        for (id, conn) in self.connections.open_mut() {
+            let Some(meta) = conn.meta.as_mut() else {
+                continue;
+            };
+            let was_failed = matches!(meta.status, MetaStatus::Failed(_));
+            let changed = meta.poll();
+            if let MetaStatus::Failed(err) = &meta.status {
+                if !was_failed {
+                    failure = Some(format!("Completion unavailable: {err}"));
+                }
             }
+            refresh |= changed && id == current;
         }
-        if changed && self.popup.is_some() && self.target == Target::Snowflake {
+        if let Some(status) = failure {
+            self.status = status;
+        }
+        if refresh && self.popup.is_some() {
             self.refresh_popup(false);
         }
     }
@@ -398,10 +377,10 @@ impl App {
             let border = if focused { Color::Blue } else { Color::DarkGray };
             editor.set_block(
                 Block::bordered()
-                    .title(match self.target {
-                        Target::Local => " SQL · local — Ctrl+R to run ",
-                        Target::Snowflake => " SQL · Snowflake — Ctrl+R to run ",
-                    })
+                    .title(format!(
+                        " SQL · {} — Ctrl+R to run ",
+                        self.connections.current_spec().name
+                    ))
                     .border_style(Style::new().fg(border)),
             );
             frame.render_widget(&*editor, top);
@@ -545,7 +524,7 @@ impl App {
                 key(" Tab "),
                 Span::raw(" results  "),
             ];
-            if self.engine.is_some() {
+            if self.connections.len() > 1 {
                 spans.push(key(" Ctrl+T "));
                 spans.push(Span::raw(" target  "));
             }
@@ -786,7 +765,7 @@ impl App {
             // macOS often binds Ctrl+Space to switching input sources, so Ctrl+N
             // opens the list too.
             KeyCode::Char(' ') | KeyCode::Char('n') if ctrl => self.refresh_popup(true),
-            KeyCode::Char('t') if ctrl => self.toggle_target(),
+            KeyCode::Char('t') if ctrl => self.switch_to_previous(),
             KeyCode::Tab | KeyCode::Esc => {
                 self.focus = Focus::Results;
                 self.popup = None;
@@ -840,10 +819,7 @@ impl App {
     /// Recompute the completion list for the cursor position. `manual` keeps the
     /// list open with a loading row while metadata is still on its way.
     fn refresh_popup(&mut self, manual: bool) {
-        let meta = match self.target {
-            Target::Local => &mut self.local_meta,
-            Target::Snowflake => &mut self.meta,
-        };
+        let meta = &mut self.connections.current(&self.store).meta;
         let (Some(editor), Some(meta)) = (&self.editor, meta) else {
             return;
         };
@@ -916,35 +892,37 @@ impl App {
         // `result_N`, not `last`: re-running the query must not narrow the
         // result it produced the previous time.
         let sql = format!("SELECT * FROM {}", Name::new(name).to_sql_with(Folding::Lower));
-        if self.target == Target::Snowflake {
-            if let Some(editor) = &self.editor {
-                self.other_sql = editor.lines().to_vec();
-            }
-        }
+        self.switch_to(ConnectionId::LOCAL);
         let mut editor = TextArea::from([sql]);
         editor.move_cursor(CursorMove::End);
         self.editor = Some(editor);
-        self.target = Target::Local;
         self.focus = Focus::Editor;
-        self.popup = None;
     }
 
-    fn toggle_target(&mut self) {
+    fn switch_to_previous(&mut self) {
         self.popup = None;
-        if self.engine.is_none() {
-            self.status = "Not connected to Snowflake; queries run locally".to_string();
+        match self.connections.previous() {
+            Some(id) => self.switch_to(id),
+            None => self.status = "No other connection to switch to".to_string(),
+        }
+    }
+
+    fn switch_to(&mut self, id: ConnectionId) {
+        self.popup = None;
+        if id == self.connections.current_id() {
             return;
         }
-        self.target = match self.target {
-            Target::Local => Target::Snowflake,
-            Target::Snowflake => Target::Local,
-        };
+        let shown = self
+            .editor
+            .as_ref()
+            .map(|e| e.lines().to_vec())
+            .unwrap_or_default();
+        let parked = self.connections.switch(id, shown);
         if let Some(editor) = &mut self.editor {
-            let shown = editor.lines().to_vec();
-            let mut swapped = TextArea::from(std::mem::replace(&mut self.other_sql, shown));
-            swapped.move_cursor(CursorMove::Bottom);
-            swapped.move_cursor(CursorMove::End);
-            *editor = swapped;
+            let mut restored = TextArea::from(parked);
+            restored.move_cursor(CursorMove::Bottom);
+            restored.move_cursor(CursorMove::End);
+            *editor = restored;
         }
     }
 
@@ -958,13 +936,7 @@ impl App {
             self.status = "Write a query first".to_string();
             return;
         }
-        match self.target {
-            Target::Snowflake => match &self.engine {
-                Some(engine) => engine.submit(sql),
-                None => return,
-            },
-            Target::Local => self.local_engine().submit(sql),
-        }
+        self.connections.current(&self.store).engine.submit(sql);
         self.popup = None;
         self.status = "running…".to_string();
     }
@@ -1402,7 +1374,7 @@ mod render_tests {
 
     fn wait_until(app: &mut App, mut done: impl FnMut(&mut App) -> bool) {
         for _ in 0..1000 {
-            app.poll_local();
+            app.poll_query();
             app.poll_meta();
             if done(app) {
                 return;
@@ -1425,7 +1397,8 @@ mod render_tests {
         assert_eq!(app.view_name.as_deref(), Some("sample"));
         app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
         assert_eq!(app.editor.as_ref().unwrap().lines(), ["SELECT * FROM sample"]);
-        assert_eq!((app.target, app.focus), (Target::Local, Focus::Editor));
+        assert_eq!(app.connections.current_id(), ConnectionId::LOCAL);
+        assert_eq!(app.focus, Focus::Editor);
 
         set_sql(&mut app, "SELECT name FROM sample WHERE city = 'Boston'");
         app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
@@ -1453,16 +1426,72 @@ mod render_tests {
     }
 
     #[test]
-    fn drilling_down_keeps_the_snowflake_query_for_ctrl_t() {
+    fn each_connection_keeps_its_own_editor_text_across_d_and_ctrl_t() {
         let mut app = sample_app();
-        app.target = Target::Snowflake;
+        let remote = app.connections.add(crate::connection::fake::spec());
+        app.connections.switch(remote, Vec::new());
         set_sql(&mut app, "SELECT 1");
-        // Stands in for a connected Snowflake engine, which tests cannot build.
-        app.other_sql = vec!["unused".into()];
         app.focus = Focus::Results;
+
         app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
-        assert_eq!(app.other_sql, ["SELECT 1"]);
+        assert_eq!(app.connections.current_id(), ConnectionId::LOCAL);
         assert_eq!(app.editor.as_ref().unwrap().lines(), ["SELECT * FROM sample"]);
+
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        app.on_key(ctrl_t);
+        assert_eq!(app.connections.current_id(), remote);
+        assert_eq!(app.editor.as_ref().unwrap().lines(), ["SELECT 1"]);
+
+        app.on_key(ctrl_t);
+        assert_eq!(app.connections.current_id(), ConnectionId::LOCAL);
+        assert_eq!(app.editor.as_ref().unwrap().lines(), ["SELECT * FROM sample"]);
+    }
+
+    #[test]
+    fn ctrl_t_reaches_local_right_after_starting_on_a_remote_connection() {
+        let mut app = App::with_remote(crate::connection::fake::spec());
+        set_sql(&mut app, "SELECT 1");
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.connections.current_id(), ConnectionId::LOCAL);
+        assert_eq!(app.editor.as_ref().unwrap().lines(), [""]);
+    }
+
+    #[test]
+    fn a_result_from_a_connection_left_behind_still_lands() {
+        let mut app = App::with_remote(crate::connection::fake::spec());
+        set_sql(&mut app, "SELECT 1");
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.connections.current_id(), ConnectionId::LOCAL);
+        app.poll_query();
+        assert_eq!(app.view_name.as_deref(), Some("result_1"));
+        assert_eq!(app.columns, ["n"]);
+    }
+
+    #[test]
+    fn a_new_result_appears_in_local_completion() {
+        let mut app = sample_app();
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        wait_until(&mut app, |a| a.view_name.as_deref() == Some("result_1"));
+        set_sql(&mut app, "SELECT * FROM res");
+        wait_until(&mut app, |a| {
+            a.refresh_popup(true);
+            a.popup
+                .as_ref()
+                .is_some_and(|p| p.completion.candidates.iter().any(|c| c.insert == "result_1"))
+        });
+    }
+
+    #[test]
+    fn the_editor_title_names_the_current_connection() {
+        let mut app = sample_app();
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let out = format!("{}", terminal.backend());
+        assert!(out.contains("SQL · local"), "{out}");
+        assert!(!out.contains("Ctrl+T"), "no other connection to switch to:\n{out}");
     }
 
     #[test]

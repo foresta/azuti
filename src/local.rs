@@ -10,33 +10,66 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::context::SQLOptions;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
-use crate::query::QueryOutcome;
+use crate::connection::{Engine, QueryOutcome};
 
 /// Always points at the most recently displayed result.
 pub const LAST: &str = "last";
 
-enum LocalCommand {
-    Register {
-        name: String,
-        batch: RecordBatch,
-        as_last: bool,
-    },
-    Query(String),
-}
-
-#[derive(Debug)]
-pub enum LocalEvent {
-    Registered,
-    RegisterFailed { name: String, error: String },
-    Result(QueryOutcome),
-}
-
-/// Runs DataFusion on its own thread. Registrations and queries share one
-/// queue, so a query always sees every table registered before it.
-pub struct LocalEngine {
-    cmd_tx: Sender<LocalCommand>,
-    event_rx: Receiver<LocalEvent>,
+pub struct ResultStore {
     ctx: SessionContext,
+}
+
+impl std::fmt::Debug for ResultStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResultStore").finish_non_exhaustive()
+    }
+}
+
+impl Default for ResultStore {
+    fn default() -> Self {
+        let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "snowflake");
+        Self {
+            ctx: SessionContext::new_with_config(config),
+        }
+    }
+}
+
+impl ResultStore {
+    pub fn context(&self) -> SessionContext {
+        self.ctx.clone()
+    }
+
+    /// Registers an opened file's data. It is registered from the rows already
+    /// loaded for display rather than re-read by DataFusion, so SQL sees the
+    /// same column types as the grid.
+    pub fn register_file(&self, name: &str, batch: RecordBatch) -> Result<()> {
+        self.register(name, batch, false)
+    }
+
+    /// Registers a displayed result under `name` and as [`LAST`], replacing
+    /// either if it already exists.
+    pub fn register_result(&self, name: &str, batch: RecordBatch) -> Result<()> {
+        self.register(name, batch, true)
+    }
+
+    /// Synchronous on the caller's thread: it only wraps shared column arrays,
+    /// and finishing before returning means any query submitted afterwards sees
+    /// the table.
+    fn register(&self, name: &str, batch: RecordBatch, as_last: bool) -> Result<()> {
+        let batch = sql_friendly_columns(batch)?;
+        let table = Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]])?);
+        let aliases: &[&str] = if as_last { &[name, LAST] } else { &[name] };
+        for alias in aliases {
+            self.ctx.deregister_table(*alias)?;
+            self.ctx.register_table(*alias, table.clone())?;
+        }
+        Ok(())
+    }
+}
+
+pub struct LocalEngine {
+    sql_tx: Sender<String>,
+    result_rx: Receiver<QueryOutcome>,
     _handle: JoinHandle<()>,
 }
 
@@ -47,60 +80,33 @@ impl std::fmt::Debug for LocalEngine {
 }
 
 impl LocalEngine {
-    pub fn spawn() -> Self {
-        let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "snowflake");
-        let ctx = SessionContext::new_with_config(config);
-        let (cmd_tx, cmd_rx) = mpsc::channel();
-        let (event_tx, event_rx) = mpsc::channel();
-        let worker_ctx = ctx.clone();
-        let handle = thread::spawn(move || worker(worker_ctx, cmd_rx, event_tx));
+    pub fn spawn(ctx: SessionContext) -> Self {
+        let (sql_tx, sql_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let handle = thread::spawn(move || worker(ctx, sql_rx, result_tx));
         Self {
-            cmd_tx,
-            event_rx,
-            ctx,
+            sql_tx,
+            result_rx,
             _handle: handle,
         }
     }
+}
 
-    /// Registers an opened file's data. It is registered from the rows already
-    /// loaded for display rather than re-read by DataFusion, so SQL sees the
-    /// same column types as the grid.
-    pub fn register_file(&self, name: &str, batch: RecordBatch) {
-        self.register(name, batch, false);
+impl Engine for LocalEngine {
+    fn submit(&self, sql: String) {
+        let _ = self.sql_tx.send(sql);
     }
 
-    /// Registers a displayed result under `name` and as [`LAST`], replacing
-    /// either if it already exists.
-    pub fn register_result(&self, name: &str, batch: RecordBatch) {
-        self.register(name, batch, true);
-    }
-
-    fn register(&self, name: &str, batch: RecordBatch, as_last: bool) {
-        let _ = self.cmd_tx.send(LocalCommand::Register {
-            name: name.to_string(),
-            batch,
-            as_last,
-        });
-    }
-
-    pub fn submit(&self, sql: String) {
-        let _ = self.cmd_tx.send(LocalCommand::Query(sql));
-    }
-
-    pub fn poll(&self) -> Vec<LocalEvent> {
-        self.event_rx.try_iter().collect()
-    }
-
-    pub fn context(&self) -> SessionContext {
-        self.ctx.clone()
+    fn poll(&self) -> Option<QueryOutcome> {
+        self.result_rx.try_recv().ok()
     }
 }
 
-fn worker(ctx: SessionContext, cmd_rx: Receiver<LocalCommand>, event_tx: Sender<LocalEvent>) {
+fn worker(ctx: SessionContext, sql_rx: Receiver<String>, result_tx: Sender<QueryOutcome>) {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
-            let _ = event_tx.send(LocalEvent::Result(Err(format!("starting local SQL: {e}"))));
+            let _ = result_tx.send(Err(format!("starting local SQL: {e}")));
             return;
         }
     };
@@ -110,40 +116,14 @@ fn worker(ctx: SessionContext, cmd_rx: Receiver<LocalCommand>, event_tx: Sender<
         .with_allow_ddl(false)
         .with_allow_dml(false)
         .with_allow_statements(false);
-    while let Ok(cmd) = cmd_rx.recv() {
-        let event = match cmd {
-            LocalCommand::Register {
-                name,
-                batch,
-                as_last,
-            } => match register(&ctx, &name, batch, as_last) {
-                Ok(()) => LocalEvent::Registered,
-                Err(e) => LocalEvent::RegisterFailed {
-                    name,
-                    error: format!("{e:#}"),
-                },
-            },
-            LocalCommand::Query(sql) => LocalEvent::Result(
-                runtime
-                    .block_on(async { ctx.sql_with_options(&sql, options).await?.collect().await })
-                    .map_err(|e| e.to_string()),
-            ),
-        };
-        if event_tx.send(event).is_err() {
+    while let Ok(sql) = sql_rx.recv() {
+        let outcome = runtime
+            .block_on(async { ctx.sql_with_options(&sql, options).await?.collect().await })
+            .map_err(|e| e.to_string());
+        if result_tx.send(outcome).is_err() {
             return;
         }
     }
-}
-
-fn register(ctx: &SessionContext, name: &str, batch: RecordBatch, as_last: bool) -> Result<()> {
-    let batch = sql_friendly_columns(batch)?;
-    let table = Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]])?);
-    let aliases: &[&str] = if as_last { &[name, LAST] } else { &[name] };
-    for alias in aliases {
-        ctx.deregister_table(*alias)?;
-        ctx.register_table(*alias, table.clone())?;
-    }
-    Ok(())
 }
 
 /// DataFusion lower-cases unquoted identifiers, so an upper-case column from
@@ -228,27 +208,27 @@ mod tests {
         DataTable::load(&path).unwrap().batch().clone()
     }
 
-    fn next(engine: &LocalEngine) -> LocalEvent {
+    fn query(engine: &LocalEngine, sql: &str) -> QueryOutcome {
+        engine.submit(sql.to_string());
         for _ in 0..1000 {
-            if let Some(e) = engine.poll().into_iter().next() {
-                return e;
+            if let Some(outcome) = engine.poll() {
+                return outcome;
             }
             thread::sleep(Duration::from_millis(5));
         }
-        panic!("no event from the local engine");
-    }
-
-    fn query(engine: &LocalEngine, sql: &str) -> std::result::Result<Vec<RecordBatch>, String> {
-        engine.submit(sql.to_string());
-        match next(engine) {
-            LocalEvent::Result(r) => r,
-            other => panic!("{sql}: {other:?}"),
-        }
+        panic!("no result for {sql}");
     }
 
     fn rows(engine: &LocalEngine, sql: &str) -> usize {
         let batches = query(engine, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
         batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    fn with_sample() -> (ResultStore, LocalEngine) {
+        let store = ResultStore::default();
+        store.register_file("sample", sample()).unwrap();
+        let engine = LocalEngine::spawn(store.context());
+        (store, engine)
     }
 
     #[test]
@@ -263,30 +243,24 @@ mod tests {
 
     #[test]
     fn queries_a_registered_file_by_its_name_in_any_case() {
-        let engine = LocalEngine::spawn();
-        engine.register_file("sample", sample());
-        assert!(matches!(next(&engine), LocalEvent::Registered));
+        let (_store, engine) = with_sample();
         assert_eq!(rows(&engine, "SELECT * FROM sample WHERE city = 'Boston'"), 2);
         assert_eq!(rows(&engine, "SELECT * FROM SAMPLE LIMIT 1"), 1);
     }
 
     #[test]
     fn a_result_is_reachable_as_result_n_and_last_but_a_file_is_not_last() {
-        let engine = LocalEngine::spawn();
-        engine.register_file("sample", sample());
-        next(&engine);
+        let (store, engine) = with_sample();
         assert!(query(&engine, "SELECT * FROM last").is_err());
 
         let first = query(&engine, "SELECT id FROM sample").unwrap();
         let total: usize = first.iter().map(|b| b.num_rows()).sum();
-        engine.register_result("result_1", first[0].clone());
-        next(&engine);
+        store.register_result("result_1", first[0].clone()).unwrap();
         assert_eq!(rows(&engine, "SELECT * FROM result_1"), total);
         assert_eq!(rows(&engine, "SELECT * FROM last"), total);
 
         let one = query(&engine, "SELECT id FROM sample LIMIT 1").unwrap();
-        engine.register_result("result_2", one[0].clone());
-        next(&engine);
+        store.register_result("result_2", one[0].clone()).unwrap();
         assert_eq!(rows(&engine, "SELECT * FROM last"), 1);
         assert_eq!(rows(&engine, "SELECT * FROM result_1"), total);
     }
@@ -301,9 +275,9 @@ mod tests {
         ]);
         let col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
         let batch = RecordBatch::try_new(Arc::new(schema), vec![col.clone(), col]).unwrap();
-        let engine = LocalEngine::spawn();
-        engine.register_result("result_1", batch);
-        next(&engine);
+        let store = ResultStore::default();
+        store.register_result("result_1", batch).unwrap();
+        let engine = LocalEngine::spawn(store.context());
         assert_eq!(rows(&engine, "SELECT order_id FROM last WHERE ORDER_ID > 1"), 1);
         assert_eq!(rows(&engine, "SELECT \"Mixed\" FROM last"), 2);
     }
@@ -320,9 +294,9 @@ mod tests {
         let col: ArrayRef = Arc::new(Int32Array::from(vec![1]));
         let batch =
             RecordBatch::try_new(Arc::new(schema), vec![col.clone(), col.clone(), col]).unwrap();
-        let engine = LocalEngine::spawn();
-        engine.register_result("result_1", batch);
-        assert!(matches!(next(&engine), LocalEvent::Registered));
+        let store = ResultStore::default();
+        store.register_result("result_1", batch).unwrap();
+        let engine = LocalEngine::spawn(store.context());
         let out = query(&engine, "SELECT * FROM last").unwrap();
         let names: Vec<_> = out[0].schema().fields().iter().map(|f| f.name().clone()).collect();
         assert_eq!(names, ["id", "id_2", "id_2_2"]);
@@ -332,10 +306,8 @@ mod tests {
     fn local_source_lists_registered_tables_and_their_columns() {
         use crate::catalog::source::{LocalSource, MetadataSource};
         use crate::catalog::{Children, Name, Scope};
-        let engine = LocalEngine::spawn();
-        engine.register_file("sample", sample());
-        next(&engine);
-        let mut source = LocalSource::new(engine.context()).unwrap();
+        let (store, _engine) = with_sample();
+        let mut source = LocalSource::new(store.context()).unwrap();
         let (_, current) = source.identify().unwrap();
         let (db, schema) = (current.database.unwrap(), current.schema.unwrap());
         let Children::Relations(rels) = source.fetch(&Scope::Schema(db.clone(), schema.clone())).unwrap()
@@ -353,9 +325,7 @@ mod tests {
 
     #[test]
     fn statements_that_change_state_are_rejected() {
-        let engine = LocalEngine::spawn();
-        engine.register_file("sample", sample());
-        next(&engine);
+        let (_store, engine) = with_sample();
         assert!(query(&engine, "DROP TABLE sample").is_err());
         assert!(query(&engine, "CREATE TABLE t AS SELECT 1").is_err());
         assert_eq!(rows(&engine, "SELECT * FROM sample LIMIT 1"), 1);
