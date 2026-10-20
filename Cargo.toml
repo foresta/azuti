@@ -37,3 +37,5 @@ serde = { version = "1", features = ["derive"] }
 chrono = "0.4"
 # Multi-line SQL editor widget for the interactive TUI.
 tui-textarea-2 = { version = "0.13", default-features = false, features = ["crossterm", "ratatui"] }
+serde_json = "1"
+frizbee = "0.13.0"

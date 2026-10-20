@@ -9,7 +9,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use chrono::{DateTime, Duration, NaiveTime};
 use color_eyre::eyre::{bail, eyre, Context, Result};
 use serde::Deserialize;
-use snowflake_api::{QueryResult, SnowflakeApi};
+use snowflake_api::{JsonResult, QueryResult, SnowflakeApi};
 
 /// One connection entry from Snowflake's `connections.toml` (the same file the
 /// `snow` CLI uses). All fields are optional; only the ones needed for key-pair
@@ -75,6 +75,7 @@ fn expand_tilde(s: &str) -> PathBuf {
 }
 
 /// Connection parameters for key-pair (JWT) authentication.
+#[derive(Debug, Clone)]
 pub struct SnowflakeParams {
     pub account: String,
     pub user: String,
@@ -85,40 +86,125 @@ pub struct SnowflakeParams {
     pub role: Option<String>,
 }
 
-/// Connect to Snowflake with key-pair auth, run `sql`, and return the result as
-/// Arrow record batches.
-///
-/// The query runs once, synchronously (on a short-lived Tokio runtime), before
-/// the TUI starts — so connection or SQL errors surface on the terminal rather
-/// than inside the alternate screen.
-pub fn run_query(params: &SnowflakeParams, sql: &str) -> Result<Vec<RecordBatch>> {
-    let private_key_pem = std::fs::read_to_string(&params.private_key_path).wrap_err_with(|| {
-        format!("reading private key {}", params.private_key_path.display())
-    })?;
+/// What a statement returned.
+#[derive(Debug)]
+pub enum QueryOutput {
+    Arrow(Vec<RecordBatch>),
+    /// Results Snowflake sends as a JSON rowset, such as `SHOW` and `DESCRIBE`.
+    Rows {
+        columns: Vec<String>,
+        rows: Vec<Vec<Option<String>>>,
+    },
+    /// Zero rows. snowflake-api drops the column list in this case.
+    Empty,
+}
 
-    let api = SnowflakeApi::with_certificate_auth(
-        &params.account,
-        params.warehouse.as_deref(),
-        params.database.as_deref(),
-        params.schema.as_deref(),
-        &params.user,
-        params.role.as_deref(),
-        &private_key_pem,
-    )
-    .wrap_err("initializing the Snowflake connection")?;
-
-    let runtime = tokio::runtime::Runtime::new().wrap_err("creating the async runtime")?;
-    let result = runtime
-        .block_on(api.exec(sql))
-        .wrap_err("executing the query")?;
-
-    match result {
-        QueryResult::Arrow(batches) => normalize_batches(batches),
-        QueryResult::Empty => Ok(Vec::new()),
-        QueryResult::Json(_) => {
-            bail!("query did not return Arrow data (non-SELECT statement or a session issue)")
+impl QueryOutput {
+    /// Convert to record batches for the result grid. JSON rows become an
+    /// all-Utf8 batch.
+    pub fn into_batches(self) -> Result<Vec<RecordBatch>> {
+        match self {
+            QueryOutput::Arrow(batches) => Ok(batches),
+            QueryOutput::Empty => Ok(Vec::new()),
+            QueryOutput::Rows { columns, rows } => {
+                let fields: Vec<Field> = columns
+                    .iter()
+                    .map(|c| Field::new(c, DataType::Utf8, true))
+                    .collect();
+                let arrays: Vec<ArrayRef> = (0..columns.len())
+                    .map(|i| {
+                        let col: StringArray =
+                            rows.iter().map(|r| r.get(i).cloned().flatten()).collect();
+                        Arc::new(col) as ArrayRef
+                    })
+                    .collect();
+                let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+                    .wrap_err("building a batch from JSON rows")?;
+                Ok(vec![batch])
+            }
         }
     }
+}
+
+/// A logged-in Snowflake session, reused across statements.
+pub struct Session {
+    api: SnowflakeApi,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session").finish_non_exhaustive()
+    }
+}
+
+impl Session {
+    /// Build the client with key-pair auth. snowflake-api logs in lazily on the
+    /// first statement and renews tokens itself.
+    pub fn connect(params: &SnowflakeParams) -> Result<Self> {
+        let private_key_pem =
+            std::fs::read_to_string(&params.private_key_path).wrap_err_with(|| {
+                format!("reading private key {}", params.private_key_path.display())
+            })?;
+
+        let api = SnowflakeApi::with_certificate_auth(
+            &params.account,
+            params.warehouse.as_deref(),
+            params.database.as_deref(),
+            params.schema.as_deref(),
+            &params.user,
+            params.role.as_deref(),
+            &private_key_pem,
+        )
+        .wrap_err("initializing the Snowflake connection")?;
+
+        let runtime = tokio::runtime::Runtime::new().wrap_err("creating the async runtime")?;
+        Ok(Self { api, runtime })
+    }
+
+    pub fn exec(&self, sql: &str) -> Result<QueryOutput> {
+        let result = self
+            .runtime
+            .block_on(self.api.exec(sql))
+            .wrap_err("executing the query")?;
+        match result {
+            QueryResult::Arrow(batches) => Ok(QueryOutput::Arrow(normalize_batches(batches)?)),
+            QueryResult::Empty => Ok(QueryOutput::Empty),
+            QueryResult::Json(json) => json_rows(json),
+        }
+    }
+}
+
+fn json_rows(json: JsonResult) -> Result<QueryOutput> {
+    let columns = json.schema.iter().map(|f| f.name.clone()).collect();
+    let rows = json_cells(&json.value)?;
+    Ok(QueryOutput::Rows { columns, rows })
+}
+
+fn json_cells(value: &serde_json::Value) -> Result<Vec<Vec<Option<String>>>> {
+    let Some(rows) = value.as_array() else {
+        bail!("unexpected JSON rowset shape: {value}");
+    };
+    rows.iter()
+        .map(|row| {
+            let Some(cells) = row.as_array() else {
+                bail!("unexpected JSON row shape: {row}");
+            };
+            Ok(cells
+                .iter()
+                .map(|v| match v {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    other => Some(other.to_string()),
+                })
+                .collect())
+        })
+        .collect()
+}
+
+/// Connect, run `sql` once, and return the result as record batches.
+pub fn run_query(params: &SnowflakeParams, sql: &str) -> Result<Vec<RecordBatch>> {
+    Session::connect(params)?.exec(sql)?.into_batches()
 }
 
 /// Snowflake encodes TIMESTAMP columns as a struct `{epoch, fraction[, timezone]}`
@@ -250,6 +336,27 @@ fn append_fraction(mut s: String, nanos: u32) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn json_rowset_cells_keep_nulls_and_stringify_other_values() {
+        let value = serde_json::json!([["a", null, 3], ["b", "x", true]]);
+        let rows = json_cells(&value).unwrap();
+        assert_eq!(rows[0], vec![Some("a".into()), None, Some("3".into())]);
+        assert_eq!(rows[1][2].as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn json_rows_become_a_utf8_batch_in_column_order() {
+        let out = QueryOutput::Rows {
+            columns: vec!["name".into(), "comment".into()],
+            rows: vec![vec![Some("T".into()), None]],
+        };
+        let batches = out.into_batches().unwrap();
+        let schema = batches[0].schema();
+        assert_eq!(schema.field(0).name(), "name");
+        assert_eq!(schema.field(1).name(), "comment");
+        assert!(batches[0].column(1).is_null(0));
+    }
 
     #[test]
     fn loads_named_connection() {

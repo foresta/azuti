@@ -7,16 +7,22 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{
+        Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
+    },
     DefaultTerminal, Frame,
 };
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use arrow::array::RecordBatch;
-use tui_textarea::TextArea;
+use tui_textarea::{CursorMove, TextArea};
 
+use crate::catalog::worker::MetaWorker;
+use crate::complete::context::{analyze, Expect};
+use crate::complete::rank::{CandidateKind, Completion};
 use crate::data::DataTable;
+use crate::meta::{MetaStatus, MetaSystem};
 use crate::query::QueryEngine;
 
 /// Rows beyond this are not scanned when measuring column widths (keeps load
@@ -29,6 +35,8 @@ const MAX_COL_WIDTH: u16 = 40;
 const DETAIL_PAGE_STEP: usize = 20;
 /// Height (rows) of the SQL editor pane in interactive mode.
 const EDITOR_HEIGHT: u16 = 8;
+/// Completion rows shown at once; the list scrolls past this.
+const POPUP_ROWS: u16 = 8;
 /// Filled bars (title bar, table header). White on blue was hard to read: most
 /// themes render ANSI blue dark and ANSI white as light gray. Cyan is light in
 /// nearly every theme, so black text on it keeps a high contrast.
@@ -92,6 +100,19 @@ pub struct App {
     engine: Option<QueryEngine>,
     /// Which pane has focus (interactive mode).
     focus: Focus,
+    /// Metadata catalog for completion, present only in interactive mode.
+    meta: Option<MetaSystem>,
+    /// The open completion list, if any.
+    popup: Option<CompletionPopup>,
+}
+
+#[derive(Debug)]
+struct CompletionPopup {
+    completion: Completion,
+    selected: usize,
+    /// Enter accepts only after the user picked an entry; otherwise it would
+    /// swallow the newline whenever the list opened on its own.
+    moved: bool,
 }
 
 impl App {
@@ -149,12 +170,13 @@ impl App {
     }
 
     /// Build the app in interactive mode: a SQL editor backed by a query engine.
-    pub fn interactive(engine: QueryEngine) -> Self {
+    pub fn interactive(engine: QueryEngine, meta: MetaWorker) -> Self {
         let mut editor = TextArea::default();
         editor.set_placeholder_text("SELECT …   (Ctrl+Enter or Ctrl+R to run)");
         App {
             editor: Some(editor),
             engine: Some(engine),
+            meta: Some(MetaSystem::new(meta)),
             focus: Focus::Editor,
             status: "Write a query and press Ctrl+Enter (or Ctrl+R)".to_string(),
             ..Default::default()
@@ -186,6 +208,7 @@ impl App {
             terminal.draw(|frame| self.render(frame))?;
             self.handle_events()?;
             self.poll_query();
+            self.poll_meta();
         }
         Ok(())
     }
@@ -203,6 +226,22 @@ impl App {
         }
     }
 
+    fn poll_meta(&mut self) {
+        let Some(meta) = &mut self.meta else {
+            return;
+        };
+        let was_failed = matches!(meta.status, MetaStatus::Failed(_));
+        let changed = meta.poll();
+        if let MetaStatus::Failed(err) = &meta.status {
+            if !was_failed {
+                self.status = format!("Completion unavailable: {err}");
+            }
+        }
+        if changed && self.popup.is_some() {
+            self.refresh_popup(false);
+        }
+    }
+
     fn load_result(&mut self, batches: Vec<RecordBatch>) {
         match DataTable::from_batches(batches) {
             Ok(data) => {
@@ -211,6 +250,7 @@ impl App {
                 self.status = format!("{} rows × {} cols", self.nrows, ncols);
                 self.mode = Mode::Table;
                 self.focus = Focus::Results;
+                self.popup = None;
             }
             Err(_) => {
                 self.data = None;
@@ -274,8 +314,92 @@ impl App {
         }
 
         self.render_body(frame, body);
+        self.render_popup(frame);
         self.render_detail_overlay(frame);
         frame.render_widget(Paragraph::new(self.footer_help()), footer);
+    }
+
+    fn render_popup(&self, frame: &mut Frame) {
+        let (Some(popup), Some(editor)) = (&self.popup, &self.editor) else {
+            return;
+        };
+        if self.focus != Focus::Editor {
+            return;
+        }
+        let Some(cursor) = editor.rendered_cursor_position() else {
+            return;
+        };
+        let items: Vec<(String, String)> = if popup.completion.candidates.is_empty() {
+            let row = match &popup.completion.error {
+                Some(err) => format!("error: {err}"),
+                None => "loading…".to_string(),
+            };
+            vec![(row, String::new())]
+        } else {
+            popup
+                .completion
+                .candidates
+                .iter()
+                .map(|c| {
+                    let kind = match c.kind {
+                        CandidateKind::Table => "table",
+                        CandidateKind::View => "view",
+                    };
+                    let detail = match &c.detail {
+                        Some(d) => format!("{kind} · {d}"),
+                        None => kind.to_string(),
+                    };
+                    (c.label.clone(), detail)
+                })
+                .collect()
+        };
+        let label_w = items.iter().map(|(l, _)| l.width()).max().unwrap_or(0);
+        let detail_w = items.iter().map(|(_, d)| d.width()).max().unwrap_or(0);
+        let full = frame.area();
+        let width = ((label_w + detail_w + 4) as u16).min(full.width);
+        let height = (items.len() as u16).min(POPUP_ROWS) + 2;
+
+        let typed = self.typed_width(&popup.completion);
+        let x = cursor
+            .x
+            .saturating_sub(typed + 1)
+            .min(full.width.saturating_sub(width));
+        let y = if cursor.y + 1 + height <= full.height {
+            cursor.y + 1
+        } else {
+            cursor.y.saturating_sub(height)
+        };
+        let area = Rect::new(x, y, width, height.min(full.height));
+
+        let list = List::new(items.into_iter().map(|(label, detail)| {
+            let pad = label_w - label.width() + 1;
+            ListItem::new(Line::from(vec![
+                Span::raw(label),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(detail, Style::new().fg(Color::DarkGray)),
+            ]))
+        }))
+        .block(Block::bordered().border_style(Style::new().fg(Color::Blue)))
+        .highlight_style(Style::new().reversed());
+        let mut state = ListState::default();
+        if !popup.completion.candidates.is_empty() {
+            state.select(Some(popup.selected));
+        }
+        frame.render_widget(Clear, area);
+        frame.render_stateful_widget(list, area, &mut state);
+    }
+
+    /// Width of the word between its start and the cursor, so the list lines
+    /// up with the start of the word rather than with the cursor.
+    fn typed_width(&self, completion: &Completion) -> u16 {
+        let Some(editor) = &self.editor else {
+            return 0;
+        };
+        let lines = editor.lines();
+        let cursor = byte_offset(lines, editor.cursor());
+        let text = lines.join("\n");
+        text.get(completion.replace.start..cursor)
+            .map_or(0, |s| s.width() as u16)
     }
 
     /// Render the results table, or the status line when there is no data.
@@ -302,6 +426,16 @@ impl App {
                 Span::raw(" scroll  "),
                 key(" g/G "),
                 Span::raw(" top/bottom  "),
+                key(" Esc "),
+                Span::raw(" close "),
+            ]);
+        }
+        if self.popup.is_some() && self.focus == Focus::Editor {
+            return Line::from(vec![
+                key(" ↑/↓ "),
+                Span::raw(" select  "),
+                key(" Tab "),
+                Span::raw(" accept  "),
                 key(" Esc "),
                 Span::raw(" close "),
             ]);
@@ -535,19 +669,122 @@ impl App {
     }
 
     fn on_key_editor(&mut self, key: KeyEvent) {
+        if self.popup.is_some() && self.on_key_popup(key) {
+            return;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             // Ctrl+Enter runs on terminals that can report it (needs the keyboard
             // enhancement protocol); Ctrl+R runs on every terminal.
             KeyCode::Enter if ctrl => self.run_query(),
             KeyCode::Char('r') if ctrl => self.run_query(),
-            KeyCode::Tab | KeyCode::Esc => self.focus = Focus::Results,
+            // macOS often binds Ctrl+Space to switching input sources, so Ctrl+N
+            // opens the list too.
+            KeyCode::Char(' ') | KeyCode::Char('n') if ctrl => self.refresh_popup(true),
+            KeyCode::Tab | KeyCode::Esc => {
+                self.focus = Focus::Results;
+                self.popup = None;
+            }
             _ => {
                 if let Some(editor) = &mut self.editor {
                     editor.input(key);
                 }
+                let typing = matches!(key.code, KeyCode::Char(c)
+                    if !ctrl && (c.is_alphanumeric() || matches!(c, '_' | '.' | '"' | '$')));
+                if self.popup.is_some() || typing {
+                    self.refresh_popup(false);
+                }
             }
         }
+    }
+
+    /// Handle a key while the completion list is open. Returns false to let the
+    /// key fall through to the editor.
+    fn on_key_popup(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(popup) = &mut self.popup else {
+            return false;
+        };
+        let n = popup.completion.candidates.len();
+        match key.code {
+            KeyCode::Up | KeyCode::Char('p') if n > 0 && (ctrl || key.code == KeyCode::Up) => {
+                popup.selected = (popup.selected + n - 1) % n;
+                popup.moved = true;
+            }
+            KeyCode::Down | KeyCode::Char('n') if n > 0 && (ctrl || key.code == KeyCode::Down) => {
+                popup.selected = (popup.selected + 1) % n;
+                popup.moved = true;
+            }
+            // With nothing to accept yet (loading), Tab must not fall through
+            // and move focus away from the editor.
+            KeyCode::Tab if n == 0 => {}
+            KeyCode::Tab => self.accept_completion(),
+            KeyCode::Enter if !ctrl && popup.moved => self.accept_completion(),
+            KeyCode::Esc => self.popup = None,
+            _ => {
+                if key.code == KeyCode::Enter {
+                    self.popup = None;
+                }
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Recompute the completion list for the cursor position. `manual` keeps the
+    /// list open with a loading row while metadata is still on its way.
+    fn refresh_popup(&mut self, manual: bool) {
+        let (Some(editor), Some(meta)) = (&self.editor, &mut self.meta) else {
+            return;
+        };
+        let lines = editor.lines();
+        let text = lines.join("\n");
+        let cursor = byte_offset(lines, editor.cursor());
+        let Some(ctx) = analyze(&text, cursor).filter(|c| c.expect == Expect::Relation) else {
+            self.popup = None;
+            return;
+        };
+        let completion = meta.complete(&ctx);
+        let waiting = !completion.needs.is_empty() || meta.is_connecting();
+        let status_row = waiting || completion.error.is_some();
+        let keep_open = !completion.candidates.is_empty()
+            || (status_row && (manual || self.popup.is_some() || ctx.prefix.text.is_empty()));
+        if !keep_open {
+            self.popup = None;
+            return;
+        }
+        let same_word = self
+            .popup
+            .as_ref()
+            .filter(|p| p.completion.replace.start == completion.replace.start);
+        let selected = same_word
+            .map_or(0, |p| p.selected)
+            .min(completion.candidates.len().saturating_sub(1));
+        let moved = same_word.is_some_and(|p| p.moved);
+        self.popup = Some(CompletionPopup {
+            completion,
+            selected,
+            moved,
+        });
+    }
+
+    fn accept_completion(&mut self) {
+        let (Some(popup), Some(editor)) = (self.popup.take(), &mut self.editor) else {
+            return;
+        };
+        let Some(candidate) = popup.completion.candidates.get(popup.selected) else {
+            return;
+        };
+        let text = editor.lines().join("\n");
+        let range = popup.completion.replace;
+        let (row, col) = row_col(&text, range.start);
+        let len = text.get(range).map_or(0, |s| s.chars().count());
+        // Moving the cursor would extend an active selection, and delete_str
+        // would then delete the selection instead of the word.
+        editor.cancel_selection();
+        editor.move_cursor(CursorMove::Jump(row as u16, col as u16));
+        editor.delete_str(len);
+        editor.insert_str(&candidate.insert);
     }
 
     /// Submit the editor's SQL to the query engine.
@@ -566,6 +803,7 @@ impl App {
         if let Some(engine) = &self.engine {
             engine.submit(sql);
         }
+        self.popup = None;
         self.status = "running…".to_string();
     }
 
@@ -689,6 +927,22 @@ impl App {
     fn quit(&mut self) {
         self.running = false;
     }
+}
+
+/// Byte offset into the newline-joined editor text of a (row, char column)
+/// cursor as tui-textarea reports it.
+fn byte_offset(lines: &[String], (row, col): (usize, usize)) -> usize {
+    let before: usize = lines[..row].iter().map(|l| l.len() + 1).sum();
+    let line = &lines[row];
+    before + line.char_indices().nth(col).map_or(line.len(), |(i, _)| i)
+}
+
+/// The inverse of [`byte_offset`].
+fn row_col(text: &str, offset: usize) -> (usize, usize) {
+    let head = &text[..offset];
+    let row = head.matches('\n').count();
+    let line_start = head.rfind('\n').map_or(0, |i| i + 1);
+    (row, head[line_start..].chars().count())
 }
 
 /// A small inverted key-cap span for the footer hints.
@@ -877,6 +1131,105 @@ mod render_tests {
 
         assert!(out.contains("SQL"), "editor pane should be labelled:\n{out}");
         assert!(out.contains("Ctrl+R"), "footer should show the run hint:\n{out}");
+    }
+
+    fn editor_app(text: &str, candidates: &[&str], replace: std::ops::Range<usize>) -> App {
+        use crate::complete::rank::Candidate;
+        let mut editor = TextArea::from([text]);
+        editor.move_cursor(CursorMove::End);
+        let candidates = candidates
+            .iter()
+            .map(|c| Candidate {
+                label: c.to_string(),
+                insert: c.to_string(),
+                kind: CandidateKind::Table,
+                detail: None,
+            })
+            .collect();
+        App {
+            editor: Some(editor),
+            focus: Focus::Editor,
+            popup: Some(CompletionPopup {
+                completion: Completion {
+                    candidates,
+                    replace,
+                    needs: Vec::new(),
+                    error: None,
+                },
+                selected: 0,
+                moved: false,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn completion_popup_lists_candidates_under_the_cursor() {
+        let mut app = editor_app("SELECT * FROM or", &["ORDERS", "USER_ORDERS"], 14..16);
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let out = format!("{}", terminal.backend());
+        let lines: Vec<&str> = out.lines().collect();
+        let row = lines.iter().position(|l| l.contains("ORDERS")).unwrap();
+        assert!(row >= 2, "popup should sit below the editor's first line:\n{out}");
+        assert!(out.contains("USER_ORDERS"), "{out}");
+        assert!(out.contains("accept"), "footer should show the popup keys:\n{out}");
+    }
+
+    #[test]
+    fn accepting_replaces_the_typed_prefix() {
+        let mut app = editor_app("SELECT * FROM or", &["ORDERS", "USER_ORDERS"], 14..16);
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.editor.as_ref().unwrap().lines(), ["SELECT * FROM USER_ORDERS"]);
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn enter_without_picking_closes_the_popup_and_inserts_a_newline() {
+        let mut app = editor_app("SELECT * FROM or", &["ORDERS"], 14..16);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.editor.as_ref().unwrap().lines(), ["SELECT * FROM or", ""]);
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn accepting_on_a_later_line_replaces_only_that_word() {
+        let mut app = editor_app("SELECT *", &["ORDERS"], 0..0);
+        let editor = app.editor.as_mut().unwrap();
+        editor.insert_newline();
+        editor.insert_str("FROM or");
+        app.popup.as_mut().unwrap().completion.replace = 14..16;
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.editor.as_ref().unwrap().lines(), ["SELECT *", "FROM ORDERS"]);
+    }
+
+    #[test]
+    fn accepting_ignores_an_active_selection() {
+        let mut app = editor_app("SELECT * FROM or", &["ORDERS"], 14..16);
+        let editor = app.editor.as_mut().unwrap();
+        editor.move_cursor(CursorMove::Jump(0, 10));
+        editor.start_selection();
+        editor.move_cursor(CursorMove::End);
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.editor.as_ref().unwrap().lines(), ["SELECT * FROM ORDERS"]);
+    }
+
+    #[test]
+    fn tab_while_loading_keeps_focus_in_the_editor() {
+        let mut app = editor_app("SELECT * FROM db.s.", &[], 19..19);
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(app.popup.is_some());
+    }
+
+    #[test]
+    fn cursor_offsets_round_trip_through_multibyte_lines() {
+        let lines = vec!["-- 日本語".to_string(), "FROM ab".to_string()];
+        let text = lines.join("\n");
+        let off = byte_offset(&lines, (1, 6));
+        assert_eq!(&text[off..], "b");
+        assert_eq!(row_col(&text, off), (1, 6));
     }
 
     #[test]
