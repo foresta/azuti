@@ -4,7 +4,9 @@ use std::time::SystemTime;
 use frizbee::{CaseMatching, Config, Matcher};
 
 use super::context::{CompletionContext, Expect};
-use crate::catalog::{Catalog, Children, CurrentScope, Freshness, Name, RelationKind, Scope};
+use crate::catalog::{
+    Catalog, Children, CurrentScope, Folding, Freshness, Name, RelationKind, Scope,
+};
 
 const MAX_CANDIDATES: usize = 50;
 /// Ranks names that start with what was typed above looser fuzzy matches.
@@ -121,7 +123,12 @@ pub fn complete(
         items: Vec::new(),
     };
     let db = current.database.as_ref();
-    let names: Vec<Name> = ctx.qualifier.iter().map(Name::from_ident).collect();
+    let folding = catalog.folding();
+    let names: Vec<Name> = ctx
+        .qualifier
+        .iter()
+        .map(|p| Name::from_ident_with(p, folding))
+        .collect();
     match (ctx.expect, names.as_slice()) {
         (Expect::Relation, []) => {
             if let (Some(d), Some(s)) = (db, &current.schema) {
@@ -153,10 +160,10 @@ pub fn complete(
         _ => {}
     }
     let Pool { out, items, .. } = pool;
-    rank(out, items, &ctx.prefix.text)
+    rank(out, items, &ctx.prefix.text, folding)
 }
 
-fn rank(mut out: Completion, items: Vec<Item<'_>>, typed: &str) -> Completion {
+fn rank(mut out: Completion, items: Vec<Item<'_>>, typed: &str, folding: Folding) -> Completion {
     let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
     let mut scored: Vec<(u32, usize)> = if typed.is_empty() {
         (0..names.len()).map(|i| (0, i)).collect()
@@ -195,7 +202,7 @@ fn rank(mut out: Completion, items: Vec<Item<'_>>, typed: &str) -> Completion {
             let item = &items[i];
             Candidate {
                 label: item.name.as_str().to_string(),
-                insert: format!("{}{}", item.name.to_sql(), item.suffix),
+                insert: format!("{}{}", item.name.to_sql_with(folding), item.suffix),
                 kind: item.kind,
                 detail: item.detail.clone(),
             }

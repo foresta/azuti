@@ -54,6 +54,7 @@ On start you get a three-row layout (header / results table / key hints).
 | `PageUp` / `PageDown` | Move by a page |
 | `g` / `G` | Jump to top / bottom |
 | `Enter` | Open the full-value detail view for the selected row (`Esc` to close) |
+| `d` | Query what is on screen with SQL (see [Local SQL](#local-sql)) |
 | `q`, `Esc`, `Ctrl-C` | Quit |
 
 Supported input formats: **CSV** (header row inferred) and **Parquet**. Errors
@@ -64,6 +65,32 @@ measured in terminal cells so full-width (e.g. CJK) text aligns correctly. Press
 `Enter` to open a detail view with the selected row's full, untruncated values.
 Very wide tables scroll horizontally with `←` / `→` (or `h` / `l`); `‹` / `›` in
 the title mark columns hidden off the left / right edge.
+
+## Local SQL
+
+Whatever is on screen — an opened file or a query result — can be queried with
+SQL, locally (powered by [DataFusion](https://datafusion.apache.org/)). Press `d`
+on the table: an editor opens above it with `SELECT * FROM <name>`; edit it and
+press `Ctrl+R`, and the result replaces the table below. Results can be drilled
+into again.
+
+| Name | Refers to |
+|---|---|
+| file name without extension, lower-cased (`Sales-2024.csv` → `sales_2024`) | the opened file |
+| `result_1`, `result_2`, … | each result in the order it was shown |
+| `last` | the most recent result |
+
+Table names complete as you type. All-upper-case column names (as Snowflake
+returns them) are registered in lower case, so they need no quoting; other mixed
+case names still do (`"City"`). Repeated column names, as from `SELECT *` over a
+join, get `_2`, `_3`, …. Local SQL is read-only: `CREATE`, `DROP`, `COPY` and
+the like are rejected.
+
+When connected to Snowflake, pressing `d` on the results switches the editor to
+local SQL and keeps your Snowflake query; `Ctrl+T` in the editor switches back
+and forth. The editor's title shows where the query will run. Once the editor is
+open, `Esc` on the table moves to the editor instead of quitting (`q` still
+quits).
 
 ## Snowflake
 

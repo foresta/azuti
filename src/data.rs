@@ -54,6 +54,10 @@ impl DataTable {
         Ok(Self { schema, batch })
     }
 
+    pub fn batch(&self) -> &RecordBatch {
+        &self.batch
+    }
+
     pub fn column_names(&self) -> Vec<String> {
         self.schema
             .fields()

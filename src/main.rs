@@ -2,6 +2,7 @@ mod app;
 mod catalog;
 mod complete;
 mod data;
+mod local;
 mod meta;
 mod query;
 mod snowflake;
@@ -155,12 +156,7 @@ fn build_app(cli: Cli) -> Result<App> {
         warn_if_region_locator(&params);
         let batches = snowflake::run_query(&params, sql)?;
         let data = DataTable::from_batches(batches)?;
-        let status = format!(
-            "snowflake  —  {} rows × {} cols",
-            data.num_rows(),
-            data.num_cols()
-        );
-        Ok(App::from_table(data, status))
+        Ok(App::from_table(data))
     } else if cli.has_snowflake_intent() {
         // Interactive: open the SQL editor connected to Snowflake.
         let params = cli.snowflake_params()?;

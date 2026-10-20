@@ -497,3 +497,150 @@ struct CompletionPopup { completion: Completion, selected: usize, moved: bool }
 | ShowSource の変換・ページング | `QueryOutput::Rows` / `Empty` の固定データからノードへ変換する。欠けのあるページが続いても全件そろうこと |
 | CacheStore | 一時ファイルで replace と load_all を往復する。子孫の削除 |
 | ポップアップ | `TestBackend` で描画を文字化する |
+
+## ローカル SQL
+
+`docs/architecture.md` の「ローカル SQL」の型と API。最初の縦の 1 本は、この節全体（列の補完は対象外）。
+
+### モジュール
+
+```
+src/
+  local.rs              LocalEngine、table_name_for
+  catalog/source.rs     LocalSource を追加
+  catalog/mod.rs        Folding を追加
+  app.rs                実行先、ドリルダウン、結果の命名
+```
+
+追加する依存: `datafusion = "52"`（default features を切り、sql / recursive_protection / 日付・文字列・正規表現・入れ子の関数だけを有効にする）。
+ファイルは DataFusion に読ませないので parquet feature は要らない。recursive_protection は深い SQL でスタックが溢れないように残す。
+53 以降は arrow 58 なので、arrow を上げるまで 52 に固定する。
+
+### 識別子の正規化
+
+```rust
+/// クォートしない識別子をどちらに揃えるか。Snowflake は大文字、DataFusion は小文字。
+pub enum Folding { Upper, Lower }
+
+impl Name {
+    pub fn from_ident_with(part: &IdentPart, folding: Folding) -> Self;
+    /// クォートせずに書ける名前（folding に揃った文字と数字・`_`・`$`、予約語でない）はそのまま、それ以外は "…"。
+    pub fn to_sql_with(&self, folding: Folding) -> String;
+}
+
+impl Catalog {
+    pub fn with_folding(key: CatalogKey, folding: Folding) -> Self;   // テストでは new(key) が Upper 版
+    pub fn folding(&self) -> Folding;
+}
+```
+
+- 予約語（クォートが要る語）は Upper では Snowflake の予約語、Lower では `TABLE` と `LATERAL` だけ。DataFusion のパーサはテーブル名の位置でほぼすべてのキーワードを受け付けるため
+
+- 既存の `from_ident` / `to_sql` は `Folding::Upper` 版として残す（ShowSource が使う）
+- 補完の候補の挿入文字列と、修飾子の解決は `catalog.folding()` を使う
+- `WorkerEvent::Connected` に `folding` を載せ、MetaSystem が Catalog を作るときに使う。`MetadataSource::folding()` で返す
+
+### LocalEngine
+
+```rust
+pub struct LocalEngine {
+    cmd_tx: Sender<LocalCommand>,
+    event_rx: Receiver<LocalEvent>,
+    ctx: SessionContext,          // LocalSource に渡すための複製（内部は Arc）
+    _handle: JoinHandle<()>,
+}
+
+enum LocalCommand {
+    Register { name: String, batch: RecordBatch, as_last: bool },
+    Query(String),
+}
+
+pub enum LocalEvent {
+    /// 登録が済んだ。カタログを無効化してよい。
+    Registered,
+    RegisterFailed { name: String, error: String },
+    Result(QueryOutcome),
+}
+
+impl LocalEngine {
+    pub fn spawn() -> Self;
+    /// 表示用に読み込んだ 1 バッチ（DataTable::batch）を登録する。`last` にはしない。
+    pub fn register_file(&self, name: &str, batch: RecordBatch);
+    /// `name` と `last` の両方に登録する。既にあれば置き換える。
+    pub fn register_result(&self, name: &str, batch: RecordBatch);
+    pub fn submit(&self, sql: String);
+    pub fn poll(&self) -> Vec<LocalEvent>;
+    pub fn context(&self) -> SessionContext;
+}
+
+/// `Sales-2024.csv` → `sales_2024`。先頭が数字なら `_`、英数字が無ければ `file`、`last` / `result_N` なら `file_` を前に付ける。
+pub fn table_name_for(path: &Path) -> String;
+```
+
+- SessionContext は `datafusion.sql_parser.dialect = snowflake` で作る。スレッド内で tokio のランタイムを作り、`block_on` で回す（DataFusion の実行計画は tokio のタスクを使う）
+- クエリは `sql_with_options` で DDL・DML・SET を拒否する
+- `MemTable` で登録する。表示用の DataTable は 1 バッチに結合済みなので、その Arc を渡して共有し、コピーしない
+- 大文字だけの列名は、スキーマだけ差し替えて小文字にする（同じ小文字の列が既にあれば変えない）。
+  同じ名前が重なった列（JOIN の `SELECT *` など）は、2 つ目以降に `_2`, `_3`, … を付ける。重複があるとそのテーブルへのクエリがすべて失敗するため
+- 登録に失敗した名前が今の表示（`view_name`）なら、ドリルダウンできないよう `view_name` を消す
+- 置き換えは `deregister_table` → `register_table`
+
+### LocalSource
+
+```rust
+pub struct LocalSource { ctx: SessionContext }
+
+impl MetadataSource for LocalSource {
+    /// key は (account: "local", role: "local")、current は既定のカタログ・スキーマ（datafusion.public）、folding は Lower。
+    fn identify(&mut self) -> Result<(CatalogKey, CurrentScope)>;
+    /// Account → カタログ名、Database → スキーマ名、Schema → テーブル名、Relation → 列（TableProvider::schema）。
+    fn fetch(&mut self, scope: &Scope) -> Result<Children>;
+}
+```
+
+- `MetaWorker::spawn_with(source)` を `#[cfg(test)]` から外し、ローカル用 MetaSystem の生成に使う
+- `LocalEvent::Registered` を受けたら、App は `Scope::Schema(datafusion, public)` を無効化する（`MetaSystem::invalidate`）。
+  invalidate はその場で Context の取得も要求するので、開いているポップアップに新しいテーブルがすぐ出る
+- Relation（列）は `SchemaProvider::table` が async なので、LocalSource が持つ current_thread のランタイムで `block_on` する
+
+### App
+
+```rust
+enum Target { Snowflake, Local }
+
+struct App {
+    // 既存のフィールドに加えて
+    local: Option<LocalEngine>,
+    local_meta: Option<MetaSystem>,
+    target: Target,
+    /// 今の表示の名前（ファイル名由来の名前か result_N）。ドリルダウンの初期文に使う。
+    view_name: Option<String>,
+    results: usize,
+    /// 表示していない側の実行先のエディタの文。Ctrl+T で入れ替える。
+    other_sql: Vec<String>,
+}
+```
+
+- LocalEngine とローカル用 MetaSystem は、ファイルを開いたとき・結果を表示したときに無ければ作る
+- 結果を表示したら（Snowflake でもローカルでも）、`result_{next_result}` を振って `register_result` し、`view_name` にする
+- ファイルを開いたら `register_file(table_name_for(path))` し、`view_name` をその名前にする
+- 補完はエディタの実行先に応じて、Snowflake 用かローカル用の MetaSystem を使う
+
+| キー | 場所 | 動作 |
+|---|---|---|
+| `d` | 結果の表 | ドリルダウン。実行先をローカルにして `SELECT * FROM <view_name>` を入れ、エディタにフォーカスする。Snowflake 側の文は `other_sql` に退避する |
+| `Ctrl+T` | エディタ | 実行先を切り替え、エディタの文を `other_sql` と入れ替える（Snowflake に接続しているときだけ） |
+| `Ctrl+R` / `Ctrl+Enter` | エディタ | 実行先で実行する |
+
+エディタの枠のタイトルに実行先を出す（` SQL · local ` / ` SQL · Snowflake `）。
+
+### テスト
+
+| 対象 | 方法 |
+|---|---|
+| table_name_for | ファイル名の変換（大文字、記号、先頭の数字） |
+| LocalEngine | 登録してクエリ、`last` と `result_N` の両方で引ける、置き換え、大文字・重複の列名、読み取り専用 |
+| LocalSource | 登録したテーブルが Schema の fetch に出る |
+| Folding | 小文字の名前が Lower ではクォートされず、Upper ではクォートされる |
+| App | ドリルダウンでエディタが開き、初期文と実行先が入る（`TestBackend`） |
+

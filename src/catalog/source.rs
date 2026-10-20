@@ -4,14 +4,22 @@ use arrow::array::{Array, AsArray};
 use color_eyre::eyre::{bail, eyre, Result};
 
 use super::{
-    CatalogKey, Children, Column, CurrentScope, Database, Name, Relation, RelationKind, Schema,
-    Scope,
+    CatalogKey, Children, Column, CurrentScope, Database, Folding, Name, Relation, RelationKind,
+    Schema, Scope,
 };
+use std::sync::Arc;
+
+use datafusion::catalog::SchemaProvider;
+use datafusion::prelude::SessionContext;
+
 use crate::snowflake::{QueryOutput, Session};
 
 pub trait MetadataSource {
     fn identify(&mut self) -> Result<(CatalogKey, CurrentScope)>;
     fn fetch(&mut self, scope: &Scope) -> Result<Children>;
+    fn folding(&self) -> Folding {
+        Folding::Upper
+    }
 }
 
 /// Each page is far below SHOW's 10,000-row cap in practice: snowflake-api reads
@@ -154,6 +162,104 @@ impl MetadataSource for ShowSource {
                     .map(Children::Columns)
             }
         }
+    }
+}
+
+pub struct LocalSource {
+    ctx: SessionContext,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl LocalSource {
+    pub fn new(ctx: SessionContext) -> Result<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        Ok(Self { ctx, runtime })
+    }
+
+    fn schema(&self, db: &Name, schema: &Name) -> Result<Arc<dyn SchemaProvider>> {
+        self.ctx
+            .catalog(db.as_str())
+            .and_then(|c| c.schema(schema.as_str()))
+            .ok_or_else(|| eyre!("no local schema {}.{}", db.as_str(), schema.as_str()))
+    }
+}
+
+impl MetadataSource for LocalSource {
+    fn identify(&mut self) -> Result<(CatalogKey, CurrentScope)> {
+        let options = self.ctx.state().config_options().catalog.clone();
+        let key = CatalogKey {
+            account: "local".into(),
+            role: Name::new("local"),
+        };
+        let current = CurrentScope {
+            database: Some(Name::new(options.default_catalog)),
+            schema: Some(Name::new(options.default_schema)),
+        };
+        Ok((key, current))
+    }
+
+    fn fetch(&mut self, scope: &Scope) -> Result<Children> {
+        let named = |names: Vec<String>| {
+            let mut names: Vec<Name> = names.into_iter().map(Name::new).collect();
+            names.sort();
+            names
+        };
+        Ok(match scope {
+            Scope::Account => Children::Databases(
+                named(self.ctx.catalog_names())
+                    .into_iter()
+                    .map(|name| Database { name, comment: None })
+                    .collect(),
+            ),
+            Scope::Database(db) => {
+                let catalog = self
+                    .ctx
+                    .catalog(db.as_str())
+                    .ok_or_else(|| eyre!("no local catalog {}", db.as_str()))?;
+                Children::Schemas(
+                    named(catalog.schema_names())
+                        .into_iter()
+                        .map(|name| Schema { name, comment: None })
+                        .collect(),
+                )
+            }
+            Scope::Schema(db, schema) => Children::Relations(
+                named(self.schema(db, schema)?.table_names())
+                    .into_iter()
+                    .map(|name| Relation {
+                        name,
+                        kind: RelationKind::Table,
+                        rows: None,
+                        bytes: None,
+                        comment: None,
+                    })
+                    .collect(),
+            ),
+            Scope::Relation(db, schema, rel) => {
+                let provider = self.schema(db, schema)?;
+                let table = self
+                    .runtime
+                    .block_on(provider.table(rel.as_str()))?
+                    .ok_or_else(|| eyre!("no local table {}", rel.as_str()))?;
+                Children::Columns(
+                    table
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| Column {
+                            name: Name::new(f.name()),
+                            data_type: f.data_type().to_string(),
+                            nullable: f.is_nullable(),
+                            comment: None,
+                        })
+                        .collect(),
+                )
+            }
+        })
+    }
+
+    fn folding(&self) -> Folding {
+        Folding::Lower
     }
 }
 

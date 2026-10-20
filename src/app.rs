@@ -18,10 +18,13 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use arrow::array::RecordBatch;
 use tui_textarea::{CursorMove, TextArea};
 
+use crate::catalog::source::LocalSource;
 use crate::catalog::worker::MetaWorker;
+use crate::catalog::{CurrentScope, Folding, Name, Scope};
 use crate::complete::context::{analyze, CompletionContext, Expect};
 use crate::complete::rank::{CandidateKind, Completion};
 use crate::data::DataTable;
+use crate::local::{table_name_for, LocalEngine, LocalEvent};
 use crate::meta::{MetaStatus, MetaSystem};
 use crate::query::QueryEngine;
 
@@ -100,10 +103,30 @@ pub struct App {
     engine: Option<QueryEngine>,
     /// Which pane has focus (interactive mode).
     focus: Focus,
+    /// Where the editor's SQL runs.
+    target: Target,
+    /// DataFusion over opened files and displayed results.
+    local: Option<LocalEngine>,
+    /// Completion catalog for local SQL.
+    local_meta: Option<MetaSystem>,
+    /// What local SQL calls the data on screen (a file's table name or
+    /// `result_N`); drilling down starts from it.
+    view_name: Option<String>,
+    /// Results named so far; the next one is `result_{n + 1}`.
+    results: usize,
+    /// The editor text of the target not shown, swapped back in by Ctrl+T.
+    other_sql: Vec<String>,
     /// Metadata catalog for completion, present only in interactive mode.
     meta: Option<MetaSystem>,
     /// The open completion list, if any.
     popup: Option<CompletionPopup>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    #[default]
+    Local,
+    Snowflake,
 }
 
 #[derive(Debug)]
@@ -123,13 +146,20 @@ impl App {
             None => App::empty("No file given. Pass a .csv or .parquet path, or use --demo N."),
             Some(path) => match DataTable::load(&path) {
                 Ok(data) => {
+                    let name = table_name_for(&path);
                     let status = format!(
-                        "{}  —  {} rows × {} cols",
+                        "{name}  —  {}  —  {} rows × {} cols",
                         path.display(),
                         data.num_rows(),
                         data.num_cols()
                     );
-                    App::loaded(data, status)
+                    let mut app = App::loaded(data, status);
+                    if let Some(data) = &app.data {
+                        let batch = data.batch().clone();
+                        app.local_engine().register_file(&name, batch);
+                    }
+                    app.view_name = Some(name);
+                    app
                 }
                 // `{:#}` prints the whole eyre error chain on one line.
                 Err(err) => App::empty(&format!("Error loading {}: {:#}", path.display(), err)),
@@ -140,17 +170,16 @@ impl App {
     /// Build the app on top of a synthetic table (for stress-testing).
     pub fn from_demo(nrows: usize) -> Self {
         let data = DataTable::demo(nrows);
-        let status = format!(
-            "demo  —  {} rows × {} cols",
-            data.num_rows(),
-            data.num_cols()
-        );
-        App::loaded(data, status)
+        let mut app = App::default();
+        app.show_result(data);
+        app
     }
 
     /// Build the app on top of an already-loaded table (e.g. a query result).
-    pub fn from_table(data: DataTable, status: String) -> Self {
-        App::loaded(data, status)
+    pub fn from_table(data: DataTable) -> Self {
+        let mut app = App::default();
+        app.show_result(data);
+        app
     }
 
     fn empty(status: &str) -> Self {
@@ -177,6 +206,7 @@ impl App {
             editor: Some(editor),
             engine: Some(engine),
             meta: Some(MetaSystem::new(meta)),
+            target: Target::Snowflake,
             focus: Focus::Editor,
             status: "Write a query and press Ctrl+Enter (or Ctrl+R)".to_string(),
             ..Default::default()
@@ -197,6 +227,28 @@ impl App {
         self.data = Some(data);
     }
 
+    fn show_result(&mut self, data: DataTable) {
+        self.results += 1;
+        let name = format!("result_{}", self.results);
+        self.status = format!("{name}  —  {} rows × {} cols", data.num_rows(), data.num_cols());
+        self.local_engine()
+            .register_result(&name, data.batch().clone());
+        self.view_name = Some(name);
+        self.apply_table(data);
+    }
+
+    fn local_engine(&mut self) -> &LocalEngine {
+        if self.local.is_none() {
+            let engine = LocalEngine::spawn();
+            // Without a catalog, local SQL still runs; only completion is lost.
+            self.local_meta = LocalSource::new(engine.context())
+                .ok()
+                .map(|source| MetaSystem::new(MetaWorker::spawn_with(Box::new(source))));
+            self.local = Some(engine);
+        }
+        self.local.as_ref().expect("just created")
+    }
+
     fn has_rows(&self) -> bool {
         self.data.is_some() && self.nrows > 0
     }
@@ -208,6 +260,7 @@ impl App {
             terminal.draw(|frame| self.render(frame))?;
             self.handle_events()?;
             self.poll_query();
+            self.poll_local();
             self.poll_meta();
         }
         Ok(())
@@ -226,7 +279,46 @@ impl App {
         }
     }
 
+    fn poll_local(&mut self) {
+        let Some(local) = &self.local else {
+            return;
+        };
+        for event in local.poll() {
+            match event {
+                LocalEvent::Registered => {
+                    if let Some(meta) = &mut self.local_meta {
+                        if let CurrentScope {
+                            database: Some(db),
+                            schema: Some(schema),
+                        } = meta.current().clone()
+                        {
+                            meta.invalidate(&Scope::Schema(db, schema));
+                        }
+                    }
+                    if self.popup.is_some() && self.target == Target::Local {
+                        self.refresh_popup(false);
+                    }
+                }
+                LocalEvent::RegisterFailed { name, error } => {
+                    if self.view_name.as_ref() == Some(&name) {
+                        self.view_name = None;
+                    }
+                    self.status = format!("{name} cannot be queried: {error}");
+                }
+                LocalEvent::Result(Ok(batches)) => self.load_result(batches),
+                LocalEvent::Result(Err(err)) => self.status = format!("Query error: {err}"),
+            }
+        }
+    }
+
     fn poll_meta(&mut self) {
+        let mut changed = false;
+        if let Some(meta) = &mut self.local_meta {
+            changed |= meta.poll() && self.target == Target::Local;
+        }
+        if changed && self.popup.is_some() {
+            self.refresh_popup(false);
+        }
         let Some(meta) = &mut self.meta else {
             return;
         };
@@ -237,7 +329,7 @@ impl App {
                 self.status = format!("Completion unavailable: {err}");
             }
         }
-        if changed && self.popup.is_some() {
+        if changed && self.popup.is_some() && self.target == Target::Snowflake {
             self.refresh_popup(false);
         }
     }
@@ -245,15 +337,14 @@ impl App {
     fn load_result(&mut self, batches: Vec<RecordBatch>) {
         match DataTable::from_batches(batches) {
             Ok(data) => {
-                let ncols = data.num_cols();
-                self.apply_table(data);
-                self.status = format!("{} rows × {} cols", self.nrows, ncols);
+                self.show_result(data);
                 self.mode = Mode::Table;
                 self.focus = Focus::Results;
                 self.popup = None;
             }
             Err(_) => {
                 self.data = None;
+                self.view_name = None;
                 self.nrows = 0;
                 self.columns.clear();
                 self.col_widths.clear();
@@ -307,7 +398,10 @@ impl App {
             let border = if focused { Color::Blue } else { Color::DarkGray };
             editor.set_block(
                 Block::bordered()
-                    .title(" SQL — Ctrl+Enter / Ctrl+R to run ")
+                    .title(match self.target {
+                        Target::Local => " SQL · local — Ctrl+R to run ",
+                        Target::Snowflake => " SQL · Snowflake — Ctrl+R to run ",
+                    })
                     .border_style(Style::new().fg(border)),
             );
             frame.render_widget(&*editor, top);
@@ -443,16 +537,21 @@ impl App {
             ]);
         }
         if self.editor.is_some() && self.focus == Focus::Editor {
-            return Line::from(vec![
+            let mut spans = vec![
                 key(" Ctrl+Enter "),
                 Span::raw(" / "),
                 key(" Ctrl+R "),
                 Span::raw(" run  "),
                 key(" Tab "),
                 Span::raw(" results  "),
-                key(" Ctrl-C "),
-                Span::raw(" quit "),
-            ]);
+            ];
+            if self.engine.is_some() {
+                spans.push(key(" Ctrl+T "));
+                spans.push(Span::raw(" target  "));
+            }
+            spans.push(key(" Ctrl-C "));
+            spans.push(Span::raw(" quit "));
+            return Line::from(spans);
         }
 
         let mut spans = vec![
@@ -465,6 +564,10 @@ impl App {
             key(" Enter "),
             Span::raw(" details  "),
         ];
+        if self.view_name.is_some() {
+            spans.push(key(" d "));
+            spans.push(Span::raw(" query this  "));
+        }
         if self.editor.is_some() {
             spans.push(key(" Tab "));
             spans.push(Span::raw(" editor  "));
@@ -683,6 +786,7 @@ impl App {
             // macOS often binds Ctrl+Space to switching input sources, so Ctrl+N
             // opens the list too.
             KeyCode::Char(' ') | KeyCode::Char('n') if ctrl => self.refresh_popup(true),
+            KeyCode::Char('t') if ctrl => self.toggle_target(),
             KeyCode::Tab | KeyCode::Esc => {
                 self.focus = Focus::Results;
                 self.popup = None;
@@ -736,7 +840,11 @@ impl App {
     /// Recompute the completion list for the cursor position. `manual` keeps the
     /// list open with a loading row while metadata is still on its way.
     fn refresh_popup(&mut self, manual: bool) {
-        let (Some(editor), Some(meta)) = (&self.editor, &mut self.meta) else {
+        let meta = match self.target {
+            Target::Local => &mut self.local_meta,
+            Target::Snowflake => &mut self.meta,
+        };
+        let (Some(editor), Some(meta)) = (&self.editor, meta) else {
             return;
         };
         let lines = editor.lines();
@@ -801,11 +909,47 @@ impl App {
         }
     }
 
-    /// Submit the editor's SQL to the query engine.
-    fn run_query(&mut self) {
+    fn drill_down(&mut self) {
+        let Some(name) = self.view_name.clone() else {
+            return;
+        };
+        // `result_N`, not `last`: re-running the query must not narrow the
+        // result it produced the previous time.
+        let sql = format!("SELECT * FROM {}", Name::new(name).to_sql_with(Folding::Lower));
+        if self.target == Target::Snowflake {
+            if let Some(editor) = &self.editor {
+                self.other_sql = editor.lines().to_vec();
+            }
+        }
+        let mut editor = TextArea::from([sql]);
+        editor.move_cursor(CursorMove::End);
+        self.editor = Some(editor);
+        self.target = Target::Local;
+        self.focus = Focus::Editor;
+        self.popup = None;
+    }
+
+    fn toggle_target(&mut self) {
+        self.popup = None;
         if self.engine.is_none() {
+            self.status = "Not connected to Snowflake; queries run locally".to_string();
             return;
         }
+        self.target = match self.target {
+            Target::Local => Target::Snowflake,
+            Target::Snowflake => Target::Local,
+        };
+        if let Some(editor) = &mut self.editor {
+            let shown = editor.lines().to_vec();
+            let mut swapped = TextArea::from(std::mem::replace(&mut self.other_sql, shown));
+            swapped.move_cursor(CursorMove::Bottom);
+            swapped.move_cursor(CursorMove::End);
+            *editor = swapped;
+        }
+    }
+
+    /// Submit the editor's SQL to the query engine.
+    fn run_query(&mut self) {
         let sql = match &self.editor {
             Some(editor) => editor.lines().join("\n"),
             None => return,
@@ -814,8 +958,12 @@ impl App {
             self.status = "Write a query first".to_string();
             return;
         }
-        if let Some(engine) = &self.engine {
-            engine.submit(sql);
+        match self.target {
+            Target::Snowflake => match &self.engine {
+                Some(engine) => engine.submit(sql),
+                None => return,
+            },
+            Target::Local => self.local_engine().submit(sql),
         }
         self.popup = None;
         self.status = "running…".to_string();
@@ -836,6 +984,7 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => self.select(0),
             KeyCode::Char('G') | KeyCode::End => self.select(self.nrows.saturating_sub(1)),
             KeyCode::Enter => self.open_detail(),
+            KeyCode::Char('d') => self.drill_down(),
             _ => {}
         }
     }
@@ -1243,6 +1392,77 @@ mod render_tests {
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.focus, Focus::Editor);
         assert!(app.popup.is_some());
+    }
+
+    fn sample_app() -> App {
+        App::new(Some(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/sample.csv"),
+        ))
+    }
+
+    fn wait_until(app: &mut App, mut done: impl FnMut(&mut App) -> bool) {
+        for _ in 0..1000 {
+            app.poll_local();
+            app.poll_meta();
+            if done(app) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("timed out; status: {}", app.status);
+    }
+
+    fn set_sql(app: &mut App, sql: &str) {
+        let mut editor = TextArea::from([sql]);
+        editor.move_cursor(CursorMove::End);
+        app.editor = Some(editor);
+        app.focus = Focus::Editor;
+    }
+
+    #[test]
+    fn drilling_into_a_file_runs_local_sql_and_names_the_result() {
+        let mut app = sample_app();
+        assert_eq!(app.view_name.as_deref(), Some("sample"));
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(app.editor.as_ref().unwrap().lines(), ["SELECT * FROM sample"]);
+        assert_eq!((app.target, app.focus), (Target::Local, Focus::Editor));
+
+        set_sql(&mut app, "SELECT name FROM sample WHERE city = 'Boston'");
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        wait_until(&mut app, |a| a.view_name.as_deref() == Some("result_1"));
+        assert_eq!(app.nrows, 2);
+        assert_eq!(app.columns, ["name"]);
+
+        set_sql(&mut app, "SELECT * FROM last LIMIT 1");
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        wait_until(&mut app, |a| a.view_name.as_deref() == Some("result_2"));
+        assert_eq!(app.nrows, 1);
+    }
+
+    #[test]
+    fn local_table_names_complete_after_from() {
+        let mut app = sample_app();
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        set_sql(&mut app, "SELECT * FROM sa");
+        wait_until(&mut app, |a| {
+            a.refresh_popup(true);
+            a.popup
+                .as_ref()
+                .is_some_and(|p| p.completion.candidates.iter().any(|c| c.insert == "sample"))
+        });
+    }
+
+    #[test]
+    fn drilling_down_keeps_the_snowflake_query_for_ctrl_t() {
+        let mut app = sample_app();
+        app.target = Target::Snowflake;
+        set_sql(&mut app, "SELECT 1");
+        // Stands in for a connected Snowflake engine, which tests cannot build.
+        app.other_sql = vec!["unused".into()];
+        app.focus = Focus::Results;
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(app.other_sql, ["SELECT 1"]);
+        assert_eq!(app.editor.as_ref().unwrap().lines(), ["SELECT * FROM sample"]);
     }
 
     #[test]

@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+    Array, ArrayRef, Decimal128Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    StructArray,
 };
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Decimal128Type, Field, Schema};
 use chrono::{DateTime, Duration, NaiveTime};
 use color_eyre::eyre::{bail, eyre, Context, Result};
 use serde::Deserialize;
@@ -230,10 +231,14 @@ fn normalize_batch(batch: RecordBatch) -> Result<RecordBatch> {
     for (i, field) in schema.fields().iter().enumerate() {
         let column = batch.column(i);
         // Fall back to the original column if the shape is unexpected.
-        match converter_for(field).and_then(|conv| conv(column)) {
-            Some(text) => {
-                fields.push(Field::new(field.name(), DataType::Utf8, field.is_nullable()));
-                columns.push(text);
+        match converter_for(field).and_then(|conv| conv(field, column)) {
+            Some(converted) => {
+                fields.push(Field::new(
+                    field.name(),
+                    converted.data_type().clone(),
+                    field.is_nullable(),
+                ));
+                columns.push(converted);
             }
             None => {
                 fields.push(field.as_ref().clone());
@@ -246,14 +251,45 @@ fn normalize_batch(batch: RecordBatch) -> Result<RecordBatch> {
         .wrap_err("rebuilding batch after temporal normalization")
 }
 
+type Converter = fn(&Field, &ArrayRef) -> Option<ArrayRef>;
+
 /// Pick a converter based on Snowflake's `logicalType` field metadata.
-fn converter_for(field: &Field) -> Option<fn(&ArrayRef) -> Option<ArrayRef>> {
+fn converter_for(field: &Field) -> Option<Converter> {
     match field.metadata().get("logicalType").map(String::as_str) {
-        Some("TIMESTAMP_NTZ") | Some("TIMESTAMP_LTZ") => Some(convert_timestamp_naive),
-        Some("TIMESTAMP_TZ") => Some(convert_timestamp_tz),
-        Some("TIME") => Some(convert_time),
+        Some("TIMESTAMP_NTZ") | Some("TIMESTAMP_LTZ") => Some(|_, c| convert_timestamp_naive(c)),
+        Some("TIMESTAMP_TZ") => Some(|_, c| convert_timestamp_tz(c)),
+        Some("TIME") => Some(|_, c| convert_time(c)),
+        Some("FIXED") if field.data_type().is_integer() && scale_of(field) > 0 => {
+            Some(convert_scaled_fixed)
+        }
         _ => None,
     }
+}
+
+fn scale_of(field: &Field) -> i8 {
+    field
+        .metadata()
+        .get("scale")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Snowflake sends a small NUMBER(p, s) as plain integers holding the value
+/// times 10^s, with the scale only in the metadata. A value-preserving cast to
+/// Decimal would multiply again, so the integers are reinterpreted instead.
+fn convert_scaled_fixed(field: &Field, column: &ArrayRef) -> Option<ArrayRef> {
+    let precision = field
+        .metadata()
+        .get("precision")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(38);
+    let ints = arrow::compute::cast(column, &DataType::Int64).ok()?;
+    let ints = ints.as_any().downcast_ref::<Int64Array>()?;
+    let decimals: Decimal128Array = ints
+        .unary::<_, Decimal128Type>(i128::from)
+        .with_precision_and_scale(precision, scale_of(field))
+        .ok()?;
+    Some(Arc::new(decimals))
 }
 
 fn convert_timestamp_naive(column: &ArrayRef) -> Option<ArrayRef> {
@@ -336,6 +372,43 @@ fn append_fraction(mut s: String, nanos: u32) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn scaled_integers_become_decimals_with_the_same_value() {
+        let meta = HashMap::from([
+            ("logicalType".to_string(), "FIXED".to_string()),
+            ("precision".to_string(), "10".to_string()),
+            ("scale".to_string(), "2".to_string()),
+        ]);
+        let field = Field::new("X", DataType::Int16, true).with_metadata(meta);
+        let column: ArrayRef =
+            Arc::new(arrow::array::Int16Array::from(vec![Some(125), None, Some(-125)]));
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![column]).unwrap();
+        let out = normalize_batch(batch).unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Decimal128(10, 2));
+        let shown = arrow::util::display::array_value_to_string(out.column(0), 0).unwrap();
+        assert_eq!(shown, "1.25");
+        assert!(out.column(0).is_null(1));
+        let negative = arrow::util::display::array_value_to_string(out.column(0), 2).unwrap();
+        assert_eq!(negative, "-1.25");
+    }
+
+    #[test]
+    fn large_scaled_integers_keep_every_digit() {
+        let meta = HashMap::from([
+            ("logicalType".to_string(), "FIXED".to_string()),
+            ("precision".to_string(), "38".to_string()),
+            ("scale".to_string(), "3".to_string()),
+        ]);
+        let field = Field::new("X", DataType::Int64, true).with_metadata(meta);
+        let column: ArrayRef = Arc::new(Int64Array::from(vec![i64::MAX]));
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![column]).unwrap();
+        let out = normalize_batch(batch).unwrap();
+        let shown = arrow::util::display::array_value_to_string(out.column(0), 0).unwrap();
+        assert_eq!(shown, "9223372036854775.807");
+    }
 
     #[test]
     fn json_rowset_cells_keep_nulls_and_stringify_other_values() {

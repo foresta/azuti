@@ -38,8 +38,12 @@ impl MetaSystem {
         let mut changed = false;
         for event in self.worker.poll() {
             match event {
-                WorkerEvent::Connected { key, current } => {
-                    self.catalog = Some(Catalog::new(key));
+                WorkerEvent::Connected {
+                    key,
+                    current,
+                    folding,
+                } => {
+                    self.catalog = Some(Catalog::with_folding(key, folding));
                     self.current = current;
                     self.status = MetaStatus::Ready;
                     changed = true;
@@ -73,6 +77,19 @@ impl MetaSystem {
             self.request(scope, Priority::Demand);
         }
         completion
+    }
+
+    /// Refetches `scope` now rather than on the next keystroke, so an open
+    /// completion list picks up what changed.
+    pub fn invalidate(&mut self, scope: &Scope) {
+        if let Some(catalog) = &mut self.catalog {
+            catalog.invalidate(scope, false);
+        }
+        self.request(scope.clone(), Priority::Context);
+    }
+
+    pub fn current(&self) -> &CurrentScope {
+        &self.current
     }
 
     pub fn is_connecting(&self) -> bool {
