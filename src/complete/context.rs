@@ -128,6 +128,8 @@ fn expect_from(sql: &str, before: &[&Token]) -> Expect {
     match kw.as_str() {
         "DATABASE" if prev2.as_deref() == Some("USE") => Expect::Database,
         "SCHEMA" if prev2.as_deref() == Some("USE") => Expect::Schema,
+        // Bare `USE <db>[.<schema>]`; elsewhere `use` can be a column name.
+        "USE" if before.len() == 1 => Expect::Database,
         k if RELATION_AFTER.contains(&k) => Expect::Relation,
         k if RELATION_AFTER_LEADING.contains(&k) && before.len() == 1 => Expect::Relation,
         k if COLUMN_AFTER.contains(&k) => Expect::Column,
@@ -255,5 +257,12 @@ mod tests {
     fn use_database_and_schema() {
         assert_eq!(at("USE DATABASE |").unwrap().expect, Expect::Database);
         assert_eq!(at("USE SCHEMA |").unwrap().expect, Expect::Schema);
+        assert_eq!(at("USE |").unwrap().expect, Expect::Database);
+        assert_ne!(at("USE ROLE |").unwrap().expect, Expect::Database);
+        assert_ne!(at("USE WAREHOUSE |").unwrap().expect, Expect::Database);
+        assert_ne!(at("CREATE TABLE t (use V|").unwrap().expect, Expect::Database);
+        let c = at("use mydb.|").unwrap();
+        assert_eq!(c.expect, Expect::Database);
+        assert_eq!(c.qualifier[0].text, "mydb");
     }
 }

@@ -19,7 +19,7 @@ use arrow::array::RecordBatch;
 use tui_textarea::{CursorMove, TextArea};
 
 use crate::catalog::worker::MetaWorker;
-use crate::complete::context::{analyze, Expect};
+use crate::complete::context::{analyze, CompletionContext, Expect};
 use crate::complete::rank::{CandidateKind, Completion};
 use crate::data::DataTable;
 use crate::meta::{MetaStatus, MetaSystem};
@@ -344,6 +344,8 @@ impl App {
                     let kind = match c.kind {
                         CandidateKind::Table => "table",
                         CandidateKind::View => "view",
+                        CandidateKind::Schema => "schema",
+                        CandidateKind::Database => "database",
                     };
                     let detail = match &c.detail {
                         Some(d) => format!("{kind} · {d}"),
@@ -740,7 +742,10 @@ impl App {
         let lines = editor.lines();
         let text = lines.join("\n");
         let cursor = byte_offset(lines, editor.cursor());
-        let Some(ctx) = analyze(&text, cursor).filter(|c| c.expect == Expect::Relation) else {
+        let completes_names = |c: &CompletionContext| {
+            matches!(c.expect, Expect::Relation | Expect::Database | Expect::Schema)
+        };
+        let Some(ctx) = analyze(&text, cursor).filter(completes_names) else {
             self.popup = None;
             return;
         };
@@ -778,13 +783,22 @@ impl App {
         let text = editor.lines().join("\n");
         let range = popup.completion.replace;
         let (row, col) = row_col(&text, range.start);
-        let len = text.get(range).map_or(0, |s| s.chars().count());
+        let len = text.get(range.clone()).map_or(0, |s| s.chars().count());
         // Moving the cursor would extend an active selection, and delete_str
         // would then delete the selection instead of the word.
         editor.cancel_selection();
+        // Replacing `db` in `db.schema` must not leave `NEW..schema` behind.
+        let dot_follows = text[range.end..].starts_with('.');
+        let insert = match candidate.insert.strip_suffix('.') {
+            Some(bare) if dot_follows => bare,
+            _ => candidate.insert.as_str(),
+        };
         editor.move_cursor(CursorMove::Jump(row as u16, col as u16));
         editor.delete_str(len);
-        editor.insert_str(&candidate.insert);
+        editor.insert_str(insert);
+        if insert.ends_with('.') {
+            self.refresh_popup(false);
+        }
     }
 
     /// Submit the editor's SQL to the query engine.
@@ -1202,6 +1216,14 @@ mod render_tests {
         app.popup.as_mut().unwrap().completion.replace = 14..16;
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.editor.as_ref().unwrap().lines(), ["SELECT *", "FROM ORDERS"]);
+    }
+
+    #[test]
+    fn accepting_a_container_before_an_existing_dot_adds_no_second_dot() {
+        let mut app = editor_app("SELECT * FROM oth.public", &["OTHER."], 14..17);
+        app.editor.as_mut().unwrap().move_cursor(CursorMove::Jump(0, 17));
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.editor.as_ref().unwrap().lines(), ["SELECT * FROM OTHER.public"]);
     }
 
     #[test]

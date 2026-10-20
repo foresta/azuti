@@ -85,8 +85,10 @@ quits.
 > enhancement protocol (e.g. Kitty, WezTerm, Ghostty, recent iTerm2). Everywhere
 > else it reads as a newline — use `Ctrl+R`, which always works.
 
-**Completion** — after `FROM` / `JOIN`, table names from the current schema (or
-from `db.schema.` when you qualify the name) pop up as you type. `Ctrl+Space` or
+**Completion** — after `FROM` / `JOIN`, tables of the current schema, schemas of
+the current database and databases pop up as you type; picking a database or
+schema adds the `.` and lists what is inside it. `USE`, `USE DATABASE` and
+`USE SCHEMA` complete database and schema names. `Ctrl+Space` or
 `Ctrl+N` opens the list by hand. `↑`/`↓` pick an entry, `Tab` accepts it
 (`Enter` too, once you have moved the selection), and `Esc` closes the list.
 Names are fetched in the background with `SHOW` commands, which need no

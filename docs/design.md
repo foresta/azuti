@@ -215,7 +215,7 @@ pub struct CatalogPatch {
 - MetaWorker は (account, role) につき 1 つ。role が変われば作り直すので、Patch に key は載せない
 - `Seed` は Prefetcher の `on_applied` の対象にしない（起動時に巡回の要求が大量に出るのを避ける）
 
-## MetadataSource [縦1本は Schema のみ]
+## MetadataSource [縦1本は Account / Database / Schema]
 
 ```rust
 pub trait MetadataSource {
@@ -320,9 +320,9 @@ impl Prefetcher {
 ```
 
 - Prefetcher は方針だけを持ち、状態を持たない。返したスコープは App が `begin_fetch` を通して要求する
-- [縦1本] では `on_connected` で current schema の Schema スコープを Context で要求するだけにする
+- `on_connected` は Account、current DB の Database、current schema の Schema を Context で要求する（いずれも `SHOW` で warehouse 不要）
 
-## トークナイザと CompletionContext [縦1本は Expect::Relation のみ]
+## トークナイザと CompletionContext [縦1本は Relation / Database / Schema]
 
 ```rust
 pub enum TokenKind { Word, QuotedIdent, Str, Number, Dot, Comma, LParen, RParen, Semicolon, Op, Comment }
@@ -349,7 +349,7 @@ pub struct TableRef { pub path: Vec<IdentPart>, pub alias: Option<IdentPart> }
 pub enum Expect {
     Relation,   // FROM / JOIN / INTO / UPDATE / TABLE の後。DESCRIBE / DESC は文頭のときだけ
     Column,     // SELECT の列リスト / WHERE / ON / GROUP BY / ORDER BY / HAVING
-    Database,   // USE DATABASE の後
+    Database,   // USE DATABASE の後と、修飾なしの USE の後（`USE <db>[.<schema>]`）
     Schema,     // USE SCHEMA の後
     Keyword,    // 上記以外
 }
@@ -383,7 +383,7 @@ pub fn statement_effects(sql: &str, current: &CurrentScope) -> Vec<StatementEffe
 
 `UseRole` を受けたら、App は MetaSystem を丸ごと作り直す（新しい worker・Catalog・ストア）。
 
-## 候補の収集と順位付け [縦1本は Relation の一部のみ]
+## 候補の収集と順位付け [縦1本は Relation / Database / Schema]
 
 ```rust
 pub struct Candidate {
@@ -393,7 +393,8 @@ pub struct Candidate {
     pub detail: Option<String>,   // 型名、行数、コメント
     score: i64,
 }
-pub enum CandidateKind { Keyword, Database, Schema, Table, View, Column, Alias, Cte }
+/// 宣言順が同点時の並び順（テーブルを DB より先に出す）。
+pub enum CandidateKind { Table, View, Schema, Database, Column, Alias, Cte, Keyword }
 
 pub struct Completion {
     pub candidates: Vec<Candidate>,   // 上位 50 件
@@ -408,11 +409,22 @@ pub fn complete(ctx: &CompletionContext, catalog: &Catalog, current: &CurrentSco
 
 Expect::Relation での修飾子の解決:
 
-| qualifier | 候補 | [縦1本] |
+| qualifier | 候補 |
+|---|---|
+| なし | current schema の relations、current DB の schemas、databases |
+| 1 つ（`x.`） | x が DB なら x の schemas、current DB のスキーマなら x の relations |
+| 2 つ（`x.y.`） | x.y の relations |
+
+Expect::Database / Expect::Schema:
+
+| 文脈 | qualifier なし | `x.` |
 |---|---|---|
-| なし | current schema の relations、current DB の schemas、databases | current schema の relations のみ |
-| 1 つ（`x.`） | x が DB なら x の schemas、current DB のスキーマなら x の relations | 対象外 |
-| 2 つ（`x.y.`） | x.y の relations | 含む |
+| `USE DATABASE` / `USE` | databases | x の schemas |
+| `USE SCHEMA` | current DB の schemas、databases | x の schemas |
+
+Relation と `USE SCHEMA` の文脈で、DB やスキーマ（まだ下の階層が続くもの）を挿入するときは、末尾に `.` を付ける。
+確定したらポップアップを開き直し、そのまま次の階層を選べるようにする。直後にすでに `.` があるとき（`db.schema` の `db` を
+置き換えるとき）は `.` を付けない。
 
 Expect::Column では、qualifier が alias・テーブル名・CTE 名のどれかに一致すれば、そのテーブルの columns を候補にする。
 qualifier が無ければ tables の全カラムを候補にする。
