@@ -146,7 +146,6 @@ pub struct CatalogKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Scope {
-    #[allow(dead_code)] // TODO: constructed once the explorer lists databases
     Account,
     Database(Name),
     Schema(Name, Name),
@@ -240,7 +239,7 @@ pub enum Children {
 }
 
 impl Children {
-    fn names(&self) -> Vec<&Name> {
+    pub fn names(&self) -> Vec<&Name> {
         match self {
             Children::Databases(v) => v.iter().map(|x| &x.name).collect(),
             Children::Schemas(v) => v.iter().map(|x| &x.name).collect(),

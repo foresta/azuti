@@ -116,7 +116,13 @@ mod tests {
             Ok((key, current))
         }
 
-        fn fetch(&mut self, _scope: &Scope) -> Result<Children> {
+        fn fetch(&mut self, scope: &Scope) -> Result<Children> {
+            if *scope == Scope::Account {
+                return Ok(Children::Databases(vec![]));
+            }
+            if matches!(scope, Scope::Database(_)) {
+                return Ok(Children::Schemas(vec![]));
+            }
             Ok(Children::Relations(vec![Relation {
                 name: Name::new("ORDERS"),
                 kind: RelationKind::Table,
@@ -137,6 +143,7 @@ mod tests {
             if !c.candidates.is_empty() {
                 assert_eq!(c.candidates[0].label, "ORDERS");
                 assert_eq!(meta.status, MetaStatus::Ready);
+                assert_eq!(c.error, None);
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
